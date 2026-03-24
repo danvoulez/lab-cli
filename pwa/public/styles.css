@@ -119,6 +119,21 @@ code {
   background: rgba(255, 255, 255, 0.09);
 }
 
+.paste-btn {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  padding: 10px 12px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  width: fit-content;
+}
+
+.paste-btn:hover {
+  border-color: #ffffff;
+}
+
 .log {
   margin: 0;
   white-space: pre-wrap;

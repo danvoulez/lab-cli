@@ -5,6 +5,17 @@ Interface PWA com duas telas:
 - `backup`: chama `lab backup` e move arquivo/pasta para `/Users/ubl-ops/BACKUP-FEITO`
 - `officialize`: chama `lab officialize` e move arquivo/pasta para `/Users/ubl-ops/officialize`
 
+## Modo recomendado: Electron (desktop)
+
+Para drag-and-drop com caminho absoluto real do macOS (sem bloqueio de browser):
+
+```bash
+cd "/Users/ubl-ops/lab cli"
+make desktop
+```
+
+No Electron, o drop pega path nativo. O botao `ESCOLHER FINDER` tambem abre seletor nativo.
+
 ## Rodar
 
 ```bash
@@ -17,6 +28,8 @@ Abra:
 ```text
 http://127.0.0.1:4319
 ```
+
+Obs: no modo navegador (`make pwa`), o drag-and-drop pode nao expor caminho absoluto por sandbox do browser.
 
 ## Variaveis uteis
 

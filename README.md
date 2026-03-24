@@ -43,7 +43,10 @@ Com `Makefile` + Doppler:
 make backup FILES='"/abs/path/pasta"'
 make officialize FILES='"/abs/path/pasta"'
 make pwa
+make desktop
 ```
+
+`make desktop` abre a mesma interface em Electron (recomendado para drag-and-drop nativo no macOS).
 
 ## Contrato de comportamento
 

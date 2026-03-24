@@ -4,6 +4,8 @@ const rightArrow = document.getElementById("rightArrow");
 
 const logBackup = document.getElementById("logBackup");
 const logOfficialize = document.getElementById("logOfficialize");
+const pasteBackup = document.getElementById("pasteBackup");
+const pasteOfficialize = document.getElementById("pasteOfficialize");
 
 let screenIndex = 0;
 
@@ -42,6 +44,47 @@ function decodeFileUri(uri) {
   }
 }
 
+function normalizePossiblePath(text) {
+  const value = String(text || "").trim().replace(/^"+|"+$/g, "");
+  if (!value) return null;
+  if (value.startsWith("file://")) return decodeFileUri(value);
+  if (value.startsWith("/")) return value;
+  return null;
+}
+
+function readTextPlainPaths(event) {
+  const raw = event.dataTransfer.getData("text/plain");
+  if (!raw) return [];
+  return raw
+    .split("\n")
+    .map((line) => normalizePossiblePath(line))
+    .filter(Boolean);
+}
+
+async function readItemStringPaths(event) {
+  const items = Array.from(event.dataTransfer.items || []);
+  const stringItems = items.filter((it) => it.kind === "string");
+  const out = [];
+
+  for (const item of stringItems) {
+    const value = await new Promise((resolve) => {
+      try {
+        item.getAsString((s) => resolve(s || ""));
+      } catch {
+        resolve("");
+      }
+    });
+
+    const lines = String(value || "")
+      .split("\n")
+      .map((line) => normalizePossiblePath(line))
+      .filter(Boolean);
+    out.push(...lines);
+  }
+
+  return out;
+}
+
 function readPathsFallbackFromFiles(event) {
   const files = Array.from(event.dataTransfer.files || []);
   return files.map((f) => f.path).filter(Boolean);
@@ -50,14 +93,23 @@ function readPathsFallbackFromFiles(event) {
 async function processDrop(mode, paths) {
   appendLog(mode, `Enviando ${paths.length} item(ns) (arquivo/pasta) para ${mode}...`);
 
-  const resp = await fetch("/api/process", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ mode, paths }),
-  });
-  const data = await resp.json();
+  let data;
+  if (window.labElectron?.isDesktop) {
+    data = await window.labElectron.process(mode, paths);
+  } else {
+    const resp = await fetch("/api/process", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode, paths }),
+    });
+    data = await resp.json();
+    if (!resp.ok) {
+      appendLog(mode, `Erro API: ${data.error || "desconhecido"}`);
+      return;
+    }
+  }
 
-  if (!resp.ok) {
+  if (data?.error) {
     appendLog(mode, `Erro API: ${data.error || "desconhecido"}`);
     return;
   }
@@ -86,15 +138,17 @@ function bindDropzone(zone) {
     event.preventDefault();
     zone.classList.remove("drag");
 
+    const itemStringPaths = await readItemStringPaths(event);
     const uriPaths = readUriListFromEvent(event);
+    const textPaths = readTextPlainPaths(event);
     const fallbackPaths = readPathsFallbackFromFiles(event);
-    const paths = [...new Set([...uriPaths, ...fallbackPaths])];
+    const paths = [...new Set([...itemStringPaths, ...uriPaths, ...textPaths, ...fallbackPaths])];
 
     if (paths.length === 0) {
       appendLog(mode, "Nao consegui ler caminho absoluto do arquivo no drop.");
       appendLog(
         mode,
-        "Tente arrastar do Finder em navegador Chromium, ou use ambiente que exponha file:// no drop."
+        "Use botao COLAR CAMINHO e cole um path absoluto (ex: /Users/voce/projeto)."
       );
       return;
     }
@@ -109,6 +163,42 @@ function bindDropzone(zone) {
 
 bindDropzone(document.getElementById("dropBackup"));
 bindDropzone(document.getElementById("dropOfficialize"));
+
+function bindPasteButton(btn, mode) {
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    let normalized = null;
+
+    if (window.labElectron?.isDesktop && window.labElectron?.choosePath) {
+      const chosen = await window.labElectron.choosePath();
+      const first = Array.isArray(chosen) ? chosen[0] : null;
+      normalized = normalizePossiblePath(first || "");
+    } else {
+      const value = window.prompt(
+        "Cole caminho absoluto de arquivo ou pasta (ex: /Users/voce/projeto):"
+      );
+      normalized = normalizePossiblePath(value || "");
+    }
+
+    if (!normalized) {
+      appendLog(mode, "Caminho invalido. Informe path absoluto.");
+      return;
+    }
+    try {
+      await processDrop(mode, [normalized]);
+    } catch (err) {
+      appendLog(mode, `Falha geral: ${err.message}`);
+    }
+  });
+}
+
+bindPasteButton(pasteBackup, "backup");
+bindPasteButton(pasteOfficialize, "officialize");
+
+if (window.labElectron?.isDesktop) {
+  if (pasteBackup) pasteBackup.textContent = "ESCOLHER FINDER";
+  if (pasteOfficialize) pasteOfficialize.textContent = "ESCOLHER FINDER";
+}
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {

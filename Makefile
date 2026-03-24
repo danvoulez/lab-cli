@@ -13,7 +13,7 @@ SUPABASE_PREFIX ?= ingest
 DRIVE_ARG := $(if $(strip $(FOLDER_ID)),--drive-folder-id "$(FOLDER_ID)",)
 SUPABASE_TABLE_ARG := $(if $(strip $(SUPABASE_TABLE)),--supabase-table "$(SUPABASE_TABLE)",)
 
-.PHONY: help backup backup-dry-run officialize officialize-dry-run pwa check-files
+.PHONY: help backup backup-dry-run officialize officialize-dry-run pwa desktop check-files
 
 help:
 	@echo "Targets:"
@@ -23,6 +23,7 @@ help:
 	@echo "  make officialize FILES='\"/abs/path/file-ou-pasta\"' [SUPABASE_TABLE='official_files']"
 	@echo "  make officialize-dry-run FILES='\"/abs/path/file-ou-pasta\"'"
 	@echo "  make pwa"
+	@echo "  make desktop"
 	@echo ""
 	@echo "Variaveis:"
 	@echo "  PROJECT=$(PROJECT)"
@@ -78,3 +79,7 @@ officialize-dry-run: check-files
 pwa:
 	@doppler run --project "$(PROJECT)" --config "$(CONFIG)" -- \
 		sh -lc 'cd pwa && npm start'
+
+desktop:
+	@doppler run --project "$(PROJECT)" --config "$(CONFIG)" -- \
+		sh -lc 'cd pwa && npm run electron'
