@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#3b3b3b" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="stylesheet" href="/styles.css" />
+    <title>LAB PWA</title>
+  </head>
+  <body>
+    <main id="app">
+      <header class="topline">
+        <div class="ink">LAB</div>
+        <div class="ink subtle">ink on background</div>
+      </header>
+
+      <section class="carousel-wrap">
+        <button id="leftArrow" class="arrow" aria-label="Tela anterior">&#8592;</button>
+
+        <div class="viewport">
+          <div id="track" class="track">
+            <article class="screen">
+              <h1 class="ink big">BACKUP</h1>
+              <p class="ink">
+                Arraste arquivos ou pastas aqui. A CLI roda <code>lab backup</code>, preserva a
+                estrutura da pasta no Drive (incluindo nome original dos arquivos) e depois move o item para
+                <code>/Users/ubl-ops/BACKUP-FEITO</code>.
+              </p>
+              <div id="dropBackup" class="dropzone" data-mode="backup">
+                DROP BACKUP
+              </div>
+              <pre id="logBackup" class="log"></pre>
+            </article>
+
+            <article class="screen">
+              <h1 class="ink big">OFFICIALIZE</h1>
+              <p class="ink">
+                Arraste arquivos ou pastas aqui. A CLI roda <code>lab officialize</code> e depois
+                move o item para <code>/Users/ubl-ops/officialize</code>. Para pasta, preserva
+                arvore no Storage.
+              </p>
+              <div id="dropOfficialize" class="dropzone" data-mode="officialize">
+                DROP OFFICIALIZE
+              </div>
+              <pre id="logOfficialize" class="log"></pre>
+            </article>
+          </div>
+        </div>
+
+        <button id="rightArrow" class="arrow" aria-label="Próxima tela">&#8594;</button>
+      </section>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "version": "2026-03-24",
+  "authority": "supabase-storage",
+  "canonical_naming": {
+    "pattern": "{yyyy}-{mm}-{dd}_{pipeline}_{doc_type}_{title_slug}_{sha8}.{ext}",
+    "title_max_len": 80,
+    "title_slug_max_len": 48,
+    "default_doc_type": "document"
+  },
+  "paths": {
+    "backup_pre_delete_dir": "/Users/ubl-ops/BACKUP-FEITO",
+    "officialize_pre_delete_dir": "/Users/ubl-ops/officialize",
+    "supabase_bucket_official": "lab-official",
+    "supabase_rules_prefix": "config/rules"
+  },
+  "metadata": {
+    "required": ["title", "document_type", "language", "tags", "sha256", "canonical_name"],
+    "optional": ["description", "source_path", "pipeline", "created_at"]
+  }
+}

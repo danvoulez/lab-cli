@@ -1,0 +1,15 @@
+/target
+.DS_Store
+.env
+.env.*
+
+# Node
+pwa/node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# OS / temp
+*.log
+*.tmp

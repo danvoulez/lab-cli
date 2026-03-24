@@ -1,0 +1,9 @@
+{
+  "name": "lab-pwa",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PWA local para backup/officialize com CLI lab",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

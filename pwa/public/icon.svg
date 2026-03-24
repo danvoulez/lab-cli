@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">
+  <rect width="192" height="192" fill="#3c3c3c" />
+  <text
+    x="96"
+    y="106"
+    text-anchor="middle"
+    fill="#f2f2f2"
+    font-size="52"
+    font-family="Helvetica Neue, Arial, sans-serif"
+    font-weight="700"
+  >
+    LAB
+  </text>
+</svg>
