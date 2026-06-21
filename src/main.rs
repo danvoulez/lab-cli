@@ -18,10 +18,127 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
-use std::time::UNIX_EPOCH;
+use std::thread;
+use std::time::{Duration, UNIX_EPOCH};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+#[allow(dead_code)]
+mod clock {
+    //! Lab UTC clock — zero-dependency RFC3339 time and a UTC instant type.
+    //!
+    //! Ported from ActGraph's actgraph-clock crate, translated to Lab terminology.
+    //! The clock is a metronome: it tracks UTC time honestly and lets the caller
+    //! decide what to do with each tick. It does not execute, schedule, or mutate.
+
+    use std::fmt;
+    use std::str::FromStr;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// An instant on the UTC line, to the second. The ruler slides over this.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct UtcInstant {
+        pub epoch_seconds: i64,
+    }
+
+    impl UtcInstant {
+        pub fn now() -> Self {
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            Self { epoch_seconds: secs }
+        }
+
+        pub fn parse(value: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+            let body = value
+                .strip_suffix('Z')
+                .ok_or("UTC instant must end with Z")?;
+            let (date, time) = body.split_once('T').ok_or("UTC instant must contain T")?;
+            let mut d = date.split('-');
+            let y: i32 = d.next().ok_or("missing year")?.parse()?;
+            let m: u32 = d.next().ok_or("missing month")?.parse()?;
+            let day: u32 = d.next().ok_or("missing day")?.parse()?;
+            let mut t = time.split(':');
+            let hh: u32 = t.next().ok_or("missing hour")?.parse()?;
+            let mm: u32 = t.next().ok_or("missing minute")?.parse()?;
+            let ss: u32 = t.next().ok_or("missing second")?.parse()?;
+            if !(1..=12).contains(&m) || !(1..=31).contains(&day) || hh > 23 || mm > 59 || ss > 60 {
+                return Err("invalid UTC instant fields".into());
+            }
+            Ok(Self {
+                epoch_seconds: epoch_from_civil(y, m, day, hh, mm, ss),
+            })
+        }
+
+        pub fn add_seconds(self, seconds: i64) -> Self {
+            Self {
+                epoch_seconds: self.epoch_seconds + seconds,
+            }
+        }
+
+        pub fn to_rfc3339(self) -> String {
+            let (y, m, d, hh, mm, ss) = civil_from_epoch(self.epoch_seconds);
+            format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+        }
+    }
+
+    impl fmt::Display for UtcInstant {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.to_rfc3339())
+        }
+    }
+
+    impl FromStr for UtcInstant {
+        type Err = Box<dyn std::error::Error + Send + Sync>;
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            Self::parse(s)
+        }
+    }
+
+    fn epoch_from_civil(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> i64 {
+        let y = y as i64 - (m <= 2) as i64;
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let mp = m as i64 + if m > 2 { -3 } else { 9 };
+        let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146097 + doe - 719468;
+        days * 86400 + hh as i64 * 3600 + mm as i64 * 60 + ss as i64
+    }
+
+    fn civil_from_epoch(epoch: i64) -> (i32, u32, u32, u32, u32, u32) {
+        let days = epoch.div_euclid(86400);
+        let sod = epoch.rem_euclid(86400);
+        let z = days + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = mp + if mp < 10 { 3 } else { -9 };
+        let y = y + (m <= 2) as i64;
+        (
+            y as i32,
+            m as u32,
+            d as u32,
+            (sod / 3600) as u32,
+            ((sod % 3600) / 60) as u32,
+            (sod % 60) as u32,
+        )
+    }
+
+    pub fn now_rfc3339() -> String {
+        UtcInstant::now().to_rfc3339()
+    }
+
+    pub fn rfc3339_utc(unix_secs: i64) -> String {
+        UtcInstant { epoch_seconds: unix_secs }.to_rfc3339()
+    }
+}
 
 fn home() -> String {
     env::var("HOME").unwrap_or_else(|_| "/".to_string())
@@ -354,6 +471,61 @@ fn write_act_row(url: &str, key: &str, row: &Value) -> (String, i64) {
     rest_write_raw(url, key, LEDGER, &body)
 }
 
+/// Bridge old-format Lab acts into the one LogLine ledger.
+/// Takes the old-format shape (who, did, this, when, status, data) and emits a
+/// logline.receipt.v0 row. Extra top-level fields are folded into the receipt as AUX.
+fn emit_legacy_act(
+    url: &str,
+    key: &str,
+    who: &str,
+    did: &str,
+    this: &str,
+    when: &str,
+    status: &str,
+    data: serde_json::Map<String, Value>,
+    extra: serde_json::Map<String, Value>,
+) -> String {
+    let mut aux = data;
+    aux.extend(extra);
+    let (receipt, content_hash, tuple_hash) = canonical_receipt(
+        who, did, this, when, "", "", "", "", status, Some(aux.clone()),
+    );
+    let row = act_row(&receipt, &content_hash, &tuple_hash);
+    let (resp, code) = write_act_row(url, key, &row);
+    if (200..300).contains(&code) {
+        registered(LEDGER, "legacy act · canonical receipt", Some(&content_hash));
+    } else {
+        // Fallback: wrap the raw payload as a receipt so it is never lost.
+        let mut raw = serde_json::Map::new();
+        raw.insert("who".into(), Value::String(who.into()));
+        raw.insert("did".into(), Value::String(did.into()));
+        raw.insert("this".into(), Value::String(this.into()));
+        raw.insert("when".into(), Value::String(when.into()));
+        raw.insert("status".into(), Value::String(status.into()));
+        raw.insert("data".into(), Value::Object(aux));
+        return register_fallback(url, key, LEDGER, &serde_json::to_string(&Value::Object(raw)).unwrap_or_default());
+    }
+    resp
+}
+
+/// Bridge an old-format JSON blob (who/did/this/when/status/data) into the one ledger.
+fn emit_legacy_json(url: &str, key: &str, json: &str) -> String {
+    match serde_json::from_str::<Value>(json) {
+        Ok(Value::Object(mut m)) => {
+            let who = m.remove("who").and_then(|v| v.as_str().map(String::from)).unwrap_or_else(hostname);
+            let did = m.remove("did").and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+            let this = m.remove("this").and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+            let when = m.remove("when").and_then(|v| v.as_str().map(String::from)).unwrap_or_else(now_utc);
+            let status = m.remove("status").and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+            let data = m.remove("data").and_then(|v| v.as_object().cloned()).unwrap_or_default();
+            // Anything left in m is extra AUX.
+            let extra: serde_json::Map<String, Value> = m.into_iter().collect();
+            emit_legacy_act(url, key, &who, &did, &this, &when, &status, data, extra)
+        }
+        _ => register_fallback(url, key, LEDGER, json),
+    }
+}
+
 /// Rust-compiler-style status. A write never "fails" -- like `cargo` it always
 /// reports Registered, with a [tier] tag saying how conformant it managed to be.
 /// (The one genuine error is an unreachable ledger -- we don't fake that green.)
@@ -383,31 +555,34 @@ fn store_object(
     (resp, code, h)
 }
 
-/// Last resort so the act is NEVER lost: wrap the raw payload in a canon row and
-/// land it in lab_log (the LAB's journal). Register first, always.
-fn wrap_raw(table_attempted: &str, raw: &str) -> serde_json::Map<String, Value> {
-    let mut m = serde_json::Map::new();
-    m.insert("who".into(), Value::String(hostname()));
-    m.insert("did".into(), Value::String("write".into()));
-    m.insert("this".into(), Value::String(table_attempted.into()));
-    m.insert("when".into(), Value::String(now_utc()));
-    m.insert("status".into(), Value::String("raw".into()));
-    let mut data = serde_json::Map::new();
-    data.insert("raw".into(), Value::String(raw.into()));
-    m.insert("data".into(), Value::Object(data));
-    m
-}
-
+/// Last resort so the act is NEVER lost: wrap the raw payload in a LogLine
+/// receipt and land it in the one ledger. Register first, always.
 fn register_fallback(url: &str, key: &str, table_attempted: &str, raw: &str) -> String {
-    let wrapped = wrap_raw(table_attempted, raw);
-    let (resp, code, h) = store_object(url, key, "lab_log", &wrapped);
+    let (receipt, content_hash, tuple_hash) = canonical_receipt(
+        &hostname(),
+        "write",
+        table_attempted,
+        &now_utc(),
+        "",
+        "",
+        "",
+        "",
+        "raw",
+        Some({
+            let mut m = serde_json::Map::new();
+            m.insert("raw".into(), Value::String(raw.into()));
+            m
+        }),
+    );
+    let row = act_row(&receipt, &content_hash, &tuple_hash);
+    let (resp, code) = write_act_row(url, key, &row);
     if (200..300).contains(&code) {
-        let tier = if table_attempted == "lab_log" {
-            "raw · wrapped + hashed".to_string()
+        let tier = if table_attempted == LEDGER {
+            "raw · wrapped into LogLine receipt".to_string()
         } else {
-            format!("raw · wrapped into lab_log (from {})", table_attempted)
+            format!("raw · wrapped into LogLine receipt (from {})", table_attempted)
         };
-        registered("lab_log", &tier, Some(&h));
+        registered(LEDGER, &tier, Some(&content_hash));
         return resp;
     }
     // The only true failure: the ledger itself wouldn't take it.
@@ -419,10 +594,10 @@ fn register_fallback(url: &str, key: &str, table_attempted: &str, raw: &str) -> 
     resp
 }
 
-/// The one write path. Always lands the act; the tier tag says how clean it was.
+/// Generic write path. Prefer `emit_legacy_act` or `write_act_row` for the one ledger.
 ///   [conformant]            valid object -> JCS-hashed + canon-tagged + stored
 ///   [hash uncommitted]      table rejected canon columns -> stored raw, hash shown
-///   [raw · wrapped...]      unparseable/non-object -> wrapped into lab_log, hashed
+///   [raw · wrapped...]      unparseable/non-object -> wrapped into LogLine receipt, hashed
 fn write_hashed(url: &str, key: &str, table: &str, json_str: &str) -> String {
     match serde_json::from_str::<Value>(json_str) {
         Ok(Value::Object(map)) => {
@@ -441,7 +616,7 @@ fn write_hashed(url: &str, key: &str, table: &str, json_str: &str) -> String {
                 );
                 return resp2;
             }
-            // Table won't take it at all -> never lose the act; wrap into lab_log.
+            // Table won't take it at all -> never lose the act; wrap into LogLine receipt.
             register_fallback(url, key, table, json_str)
         }
         _ => register_fallback(url, key, table, json_str),
@@ -522,14 +697,16 @@ fn conformance(json_str: &str) {
 /// Pretty `tail` of the journal: newest at the bottom, one act per line.
 fn print_tail(url: &str, key: &str, n: usize) {
     let q = format!(
-        "select=when,who,did,this,status&order=inserted_at.desc&limit={}",
+        "select=act,inserted_at&order=inserted_at.desc&limit={}",
         n
     );
-    let body = rest_read(url, key, "lab_log", &q);
+    let body = rest_read(url, key, LEDGER, &q);
     match serde_json::from_str::<Value>(&body) {
         Ok(Value::Array(rows)) => {
+            let empty = serde_json::Map::new();
             for r in rows.iter().rev() {
-                let g = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or("");
+                let act = r.get("act").and_then(|v| v.as_object()).unwrap_or(&empty);
+                let g = |k: &str| act.get(k).and_then(|x| x.as_str()).unwrap_or("");
                 println!(
                     "{:<20}  {:<8}  {:<10}  {}  [{}]",
                     g("when"),
@@ -546,7 +723,7 @@ fn print_tail(url: &str, key: &str, n: usize) {
 
 /// Is the ledger reachable, and how fast? Returns (ok, http_code, seconds).
 fn ledger_ping(url: &str, key: &str) -> (bool, String, String) {
-    let full = format!("{}/rest/v1/lab_log?select=who&limit=1", url);
+    let full = format!("{}/rest/v1/{}?select=who&limit=1", url, LEDGER);
     let out = curl(&[
         "-sS".into(),
         "-o".into(),
@@ -641,12 +818,12 @@ fn cmd_notify(subject_raw: &str, body: &str) {
         let cutoff = shell_value(&["date", "-u", "-v-12H", "+%Y-%m-%dT%H:%M:%SZ"], "");
         if !cutoff.is_empty() {
             let q = format!(
-                "select=id&did=eq.notify&status=eq.sent&this=eq.{}&inserted_at=gt.{}&limit=1",
+                "select=who&did=eq.notify&status=eq.sent&this=eq.{}&inserted_at=gt.{}&limit=1",
                 pct(&subject),
                 cutoff
             );
-            let resp = rest_read(url, key, "lab_log", &q);
-            if resp.contains("\"id\"") {
+            let resp = rest_read(url, key, LEDGER, &q);
+            if resp.contains("\"who\"") {
                 status = "deduped";
                 eprintln!("   Notify   [deduped · same subject < 12h] {}", subject);
             }
@@ -708,7 +885,7 @@ fn cmd_notify(subject_raw: &str, body: &str) {
         );
         m.insert("data".into(), Value::Object(data));
         let json = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
-        let _ = write_hashed(url, key, "lab_log", &json);
+        let _ = emit_legacy_json(url, key, &json);
     }
     if status == "failed" {
         exit(1);
@@ -800,7 +977,7 @@ fn cmd_scan(url: &str, key: &str, subject: Option<&str>) {
     data.insert("subjects".into(), Value::Object(summary));
     m.insert("data".into(), Value::Object(data));
     let json = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
-    let _ = write_hashed(url, key, "lab_log", &json);
+    let _ = emit_legacy_json(url, key, &json);
 }
 
 fn cmd_export(url: &str, key: &str) {
@@ -898,7 +1075,7 @@ fn cmd_export(url: &str, key: &str) {
     }
     m.insert("data".into(), Value::Object(data));
     let json = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
-    let _ = write_hashed(url, key, "lab_log", &json);
+    let _ = emit_legacy_json(url, key, &json);
 }
 
 fn cmd_validate(rest: &[String]) {
@@ -1017,7 +1194,7 @@ fn cmd_judge(url: &str, key: &str) {
     data.insert("items".into(), Value::Array(items_out));
     m.insert("data".into(), Value::Object(data));
     let json = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
-    let _ = write_hashed(url, key, "lab_log", &json);
+    let _ = emit_legacy_json(url, key, &json);
 }
 
 /// The EMAIL bar is far tighter than the judge's DOWN. The judge records every
@@ -1314,7 +1491,7 @@ fn sync_manhattan_receipts(
         }
         let m = compact_manhattan_receipt(&path, &receipt, &receipt_hash);
         let json = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
-        let _ = write_hashed(url, key, "lab_log", &json);
+        let _ = emit_legacy_json(url, key, &json);
         seen.insert(receipt_hash);
         emitted += 1;
     }
@@ -1448,10 +1625,9 @@ fn cmd_audit(url: &str, key: &str) {
         data.insert("drift_items".into(), Value::Array(compact));
     }
     m.insert("data".into(), Value::Object(data));
-    let _ = write_hashed(
+    let _ = emit_legacy_json(
         url,
         key,
-        "lab_log",
         &serde_json::to_string(&Value::Object(m)).unwrap_or_default(),
     );
     let synced = sync_manhattan_receipts(url, key, Some(100), false);
@@ -1560,10 +1736,9 @@ fn run_converge(url: &str, key: &str, apply: bool) -> Option<(u64, u64, u64)> {
         hist.into_iter().map(|(k, v)| (k, Value::from(v))).collect();
     data.insert("results".into(), Value::Object(hist_obj));
     m.insert("data".into(), Value::Object(data));
-    let _ = write_hashed(
+    let _ = emit_legacy_json(
         url,
         key,
-        "lab_log",
         &serde_json::to_string(&Value::Object(m)).unwrap_or_default(),
     );
     let synced = sync_manhattan_receipts(url, key, Some(100), false);
@@ -1628,7 +1803,7 @@ fn shell_value(args: &[&str], fallback: &str) -> String {
 }
 
 fn now_utc() -> String {
-    shell_value(&["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"], "")
+    clock::now_rfc3339()
 }
 
 fn hostname() -> String {
@@ -1637,6 +1812,704 @@ fn hostname() -> String {
         return h;
     }
     shell_value(&["hostname", "-s"], "unknown")
+}
+
+/// The local Lab home: config, queue, state.
+fn lab_home() -> PathBuf {
+    PathBuf::from(home()).join(".lab")
+}
+
+fn queue_dir() -> PathBuf {
+    lab_home().join("queue")
+}
+
+fn ensure_lab_home() {
+    let _ = fs::create_dir_all(lab_home());
+    let _ = fs::create_dir_all(queue_dir());
+}
+
+/// Load the set of idempotency keys already queued or executed on this box.
+/// Kept in a simple local JSON file; it is a projection, not truth.
+fn load_clock_state() -> serde_json::Map<String, Value> {
+    let path = lab_home().join("clock.state.json");
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn save_clock_state(state: &serde_json::Map<String, Value>) {
+    let path = lab_home().join("clock.state.json");
+    if let Ok(s) = serde_json::to_string_pretty(&Value::Object(state.clone())) {
+        let _ = fs::write(&path, s);
+    }
+}
+
+/// Query the ledger for scheduled acts that are due at or before `instant`.
+fn due_acts(url: &str, key: &str, instant: &clock::UtcInstant, box_id: &str) -> Vec<Value> {
+    let now = instant.to_rfc3339();
+    // PostgREST: did in scheduler set, when <= now, aux.status = 'scheduled', order by when.
+    // aux.status is nested in the generated aux object; we query via JSON operators.
+    let query = format!(
+        "did=in.(schedule_target,route_to_devin,github_event,linear_event,slack_event,webhook_event)&when=lte.{}&status=eq.scheduled&order=when.asc&limit=200",
+        pct(&now)
+    );
+    let body = rest_read(url, key, LEDGER, &query);
+    let mut rows = match serde_json::from_str::<Value>(&body) {
+        Ok(Value::Array(a)) => a,
+        _ => return vec![],
+    };
+
+    // Filter by box affinity: aux.box matches this box, or no box specified.
+    rows.retain(|r| {
+        let empty = serde_json::Map::new();
+        let aux = r.get("aux").and_then(|v| v.as_object()).unwrap_or(&empty);
+        match aux.get("box").and_then(|v| v.as_str()) {
+            None => true,
+            Some(b) => b == box_id || b == "any",
+        }
+    });
+    rows
+}
+
+/// True if a queued or executed record for this idempotency key already exists.
+fn already_seen(state: &serde_json::Map<String, Value>, key: &str) -> bool {
+    state.get(key).is_some()
+}
+
+/// Mark a key as seen in local clock state.
+fn mark_seen(state: &mut serde_json::Map<String, Value>, key: &str, instant: &clock::UtcInstant) {
+    state.insert(
+        key.into(),
+        Value::String(instant.to_rfc3339()),
+    );
+}
+
+/// Write a 'queued' record to the ledger for a scheduled act.
+fn queue_act(
+    url: &str,
+    key: &str,
+    box_id: &str,
+    original: &Value,
+    instant: &clock::UtcInstant,
+) -> (String, i64) {
+    let original_hash = original
+        .get("content_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let target_process = original
+        .get("aux")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("target_process"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let playbook_macro = original
+        .get("aux")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("playbook_macro"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let idempotency_key = original
+        .get("aux")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("idempotency_key"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(original_hash);
+
+    let mut extra = serde_json::Map::new();
+    extra.insert("original_hash".into(), Value::String(original_hash.into()));
+    extra.insert("original_when".into(), original.get("when").cloned().unwrap_or(Value::String("".into())));
+    extra.insert("target_process".into(), Value::String(target_process.into()));
+    extra.insert("playbook_macro".into(), Value::String(playbook_macro.into()));
+    extra.insert("idempotency_key".into(), Value::String(idempotency_key.into()));
+
+    let (receipt, c_hash, t_hash) = canonical_receipt(
+        box_id,
+        "queued",
+        original_hash,
+        &instant.to_rfc3339(),
+        "lab-clock",
+        "",
+        "",
+        "",
+        "queued",
+        Some(extra),
+    );
+    let row = act_row(&receipt, &c_hash, &t_hash);
+    write_act_row(url, key, &row)
+}
+
+/// Write a local queue file for an act.
+fn write_queue_file(original: &Value, instant: &clock::UtcInstant) {
+    let original_hash = original
+        .get("content_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let filename = format!("{}-{}.json", instant.to_rfc3339(), original_hash);
+    let path = queue_dir().join(filename);
+    if let Ok(s) = serde_json::to_string_pretty(original) {
+        let _ = fs::write(&path, s);
+    }
+}
+
+/// Run one clock tick: read due acts, write queued records, populate local queue.
+fn cmd_clock_tick(url: &str, key: &str, box_id: &str) -> usize {
+    ensure_lab_home();
+    let instant = clock::UtcInstant::now();
+    let mut state = load_clock_state();
+    let due = due_acts(url, key, &instant, box_id);
+    let mut queued = 0;
+
+    for act in due {
+        let empty = serde_json::Map::new();
+        let aux = act.get("aux").and_then(|v| v.as_object()).unwrap_or(&empty);
+        let idempotency_key = aux
+            .get("idempotency_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                act.get("content_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+            });
+
+        if already_seen(&state, idempotency_key) {
+            continue;
+        }
+
+        let (body, code) = queue_act(url, key, box_id, &act, &instant);
+        if (200..300).contains(&code) {
+            write_queue_file(&act, &instant);
+            mark_seen(&mut state, idempotency_key, &instant);
+            queued += 1;
+            eprintln!(
+                "   queued {} at {} (HTTP {})",
+                idempotency_key,
+                instant.to_rfc3339(),
+                code
+            );
+        } else {
+            eprintln!(
+                "   clock: failed to queue {} (HTTP {}): {}",
+                idempotency_key,
+                code,
+                body.trim()
+            );
+        }
+    }
+
+    save_clock_state(&state);
+    queued
+}
+
+/// Backfill missed acts from a past window into the queue.
+fn cmd_clock_backfill(url: &str, key: &str, box_id: &str, from: &str, to: &str) -> usize {
+    let from_inst = clock::UtcInstant::parse(from).unwrap_or_else(|_| {
+        eprintln!("lab clock backfill: invalid from time '{}'", from);
+        exit(2);
+    });
+    let to_inst = clock::UtcInstant::parse(to).unwrap_or_else(|_| {
+        eprintln!("lab clock backfill: invalid to time '{}'", to);
+        exit(2);
+    });
+    ensure_lab_home();
+    let mut state = load_clock_state();
+    let query = format!(
+        "did=in.(schedule_target,route_to_devin,github_event,linear_event,slack_event,webhook_event)&when=gte.{}&when=lte.{}&status=eq.scheduled&order=when.asc&limit=500",
+        pct(&from_inst.to_rfc3339()),
+        pct(&to_inst.to_rfc3339())
+    );
+    let body = rest_read(url, key, LEDGER, &query);
+    let rows = match serde_json::from_str::<Value>(&body) {
+        Ok(Value::Array(a)) => a,
+        _ => {
+            eprintln!("lab clock backfill: no rows found or query failed");
+            return 0;
+        }
+    };
+    let mut queued = 0;
+    for act in rows {
+        let empty = serde_json::Map::new();
+        let aux = act.get("aux").and_then(|v| v.as_object()).unwrap_or(&empty);
+        let idempotency_key = aux
+            .get("idempotency_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                act.get("content_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+            });
+        if already_seen(&state, idempotency_key) {
+            continue;
+        }
+        let when_str = act.get("when").and_then(|v| v.as_str()).unwrap_or("");
+        let when_inst = clock::UtcInstant::parse(when_str).unwrap_or(clock::UtcInstant::now());
+        let (body, code) = queue_act(url, key, box_id, &act, &when_inst);
+        if (200..300).contains(&code) {
+            write_queue_file(&act, &when_inst);
+            mark_seen(&mut state, idempotency_key, &when_inst);
+            queued += 1;
+        } else {
+            eprintln!(
+                "   backfill: failed to queue {} (HTTP {}): {}",
+                idempotency_key,
+                code,
+                body.trim()
+            );
+        }
+    }
+    save_clock_state(&state);
+    queued
+}
+
+/// Run the clock daemon: tick every `tick_seconds`.
+fn cmd_clock_daemon(url: &str, key: &str, box_id: &str, tick_seconds: u64) {
+    ensure_lab_home();
+    eprintln!(
+        "lab clock daemon started on {}. tick={}s. Press Ctrl-C to stop.",
+        box_id, tick_seconds
+    );
+    loop {
+        let queued = cmd_clock_tick(url, key, box_id);
+        if queued > 0 {
+            eprintln!("lab clock: queued {} act(s) at {}", queued, clock::now_rfc3339());
+        }
+        thread::sleep(Duration::from_secs(tick_seconds));
+    }
+}
+
+/// List items in the local execution queue.
+fn cmd_queue_list(n: usize) {
+    ensure_lab_home();
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(rd) = fs::read_dir(queue_dir()) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_file() {
+                entries.push((e.file_name().to_string_lossy().to_string(), path));
+            }
+        }
+    }
+    entries.sort();
+    let limit = if n == 0 { entries.len() } else { n.min(entries.len()) };
+    for (name, _path) in entries.iter().take(limit) {
+        println!("{}", name);
+    }
+    if entries.is_empty() {
+        println!("(queue empty)");
+    }
+}
+
+/// Execute the next item in the queue by starting a Devin CLI session.
+fn cmd_executor_run(url: &str, key: &str, box_id: &str) -> bool {
+    ensure_lab_home();
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(rd) = fs::read_dir(queue_dir()) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_file() {
+                entries.push((e.file_name().to_string_lossy().to_string(), path));
+            }
+        }
+    }
+    entries.sort();
+    let (name, path) = match entries.first() {
+        Some(x) => x.clone(),
+        None => {
+            println!("(queue empty)");
+            return false;
+        }
+    };
+
+    let act = match fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    {
+        Some(v) => v,
+        None => {
+            eprintln!("lab executor: failed to parse {}", name);
+            let _ = fs::remove_file(&path);
+            return false;
+        }
+    };
+
+    let original_hash = act
+        .get("content_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let target_process = act
+        .get("aux")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("target_process"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let playbook_macro = act
+        .get("aux")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("playbook_macro"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("!lab_read_first");
+    let this_box = box_id;
+
+    let needed_acu = acu_limit_for_act(&act);
+    let remaining = budget_remaining();
+    if remaining < needed_acu {
+        eprintln!(
+            "lab executor: budget exhausted (remaining {} < needed {}) for {}",
+            remaining, needed_acu, original_hash
+        );
+        budget_exhausted_ghost(url, key, box_id, &act, remaining, needed_acu);
+        // Remove from queue so it is not retried forever; the ghost is the record.
+        let _ = fs::remove_file(&path);
+        return false;
+    }
+
+    // Pause switch: a human can create ~/.lab/PAUSE to stop new executions.
+    if lab_home().join("PAUSE").exists() {
+        eprintln!("lab executor: PAUSE file exists; not running {}. Remove ~/.lab/PAUSE to resume.", original_hash);
+        return false;
+    }
+
+    let prompt = format!(
+        "{playbook_macro}\n\nRun process {target_process} for content_hash {original_hash} on box {this_box}. Read the target act from the Lab ledger, execute it, and produce a memory-register or evidence-closure receipt."
+    );
+
+    eprintln!("lab executor: running {} with playbook {} (estimated {} ACU)", original_hash, playbook_macro, needed_acu);
+    record_acu_spent(needed_acu);
+    let status = Command::new("devin")
+        .args(["-p", &prompt])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            let _ = fs::remove_file(&path);
+            // Optionally write a done record here; the Devin session should write its own output.
+            true
+        }
+        Ok(s) => {
+            eprintln!("lab executor: devin exited with {:?}", s.code());
+            false
+        }
+        Err(e) => {
+            eprintln!("lab executor: failed to run devin: {}", e);
+            false
+        }
+    }
+}
+
+/// Run the executor daemon: process the queue forever.
+fn cmd_executor_daemon(url: &str, key: &str, box_id: &str, poll_seconds: u64) {
+    ensure_lab_home();
+    eprintln!(
+        "lab executor daemon started on {}. poll={}s. Press Ctrl-C to stop.",
+        box_id, poll_seconds
+    );
+    loop {
+        if !cmd_executor_run(url, key, box_id) {
+            thread::sleep(Duration::from_secs(poll_seconds));
+        }
+    }
+}
+
+// --- ACU budget -------------------------------------------------------------
+
+fn budget_path() -> PathBuf {
+    lab_home().join("budget.json")
+}
+
+struct Budget {
+    daily_acu_max: f64,
+    reset_hour_utc: u32,
+    spent_today: f64,
+    last_reset: String,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            daily_acu_max: 20.0,
+            reset_hour_utc: 0,
+            spent_today: 0.0,
+            last_reset: clock::now_rfc3339(),
+        }
+    }
+}
+
+fn budget_to_value(b: &Budget) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("daily_acu_max".into(), Value::Number(serde_json::Number::from_f64(b.daily_acu_max).unwrap_or_else(|| 0.into())));
+    m.insert("reset_hour_utc".into(), Value::Number(b.reset_hour_utc.into()));
+    m.insert("spent_today".into(), Value::Number(serde_json::Number::from_f64(b.spent_today).unwrap_or_else(|| 0.into())));
+    m.insert("last_reset".into(), Value::String(b.last_reset.clone()));
+    Value::Object(m)
+}
+
+fn load_budget() -> Budget {
+    fs::read_to_string(budget_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .map(|m| {
+            let mut b = Budget {
+                daily_acu_max: m.get("daily_acu_max").and_then(|v| v.as_f64()).unwrap_or(20.0),
+                reset_hour_utc: m.get("reset_hour_utc").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                spent_today: m.get("spent_today").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                last_reset: m.get("last_reset").and_then(|v| v.as_str()).unwrap_or(&clock::now_rfc3339()).to_string(),
+            };
+            let now = clock::UtcInstant::now();
+            let last = clock::UtcInstant::parse(&b.last_reset).unwrap_or(now);
+            let last_day = last.epoch_seconds.div_euclid(86400);
+            let now_day = now.epoch_seconds.div_euclid(86400);
+            let last_hour = last.epoch_seconds.rem_euclid(86400) / 3600;
+            let now_hour = now.epoch_seconds.rem_euclid(86400) / 3600;
+            let crossed = now_day > last_day
+                || (now_day == last_day
+                    && now_hour >= b.reset_hour_utc as i64
+                    && last_hour < b.reset_hour_utc as i64);
+            if crossed {
+                b.spent_today = 0.0;
+                b.last_reset = now.to_rfc3339();
+            }
+            b
+        })
+        .unwrap_or_default()
+}
+
+fn save_budget(budget: &Budget) {
+    let v = budget_to_value(budget);
+    if let Ok(s) = serde_json::to_string_pretty(&v) {
+        let _ = fs::write(budget_path(), s);
+    }
+}
+
+fn budget_remaining() -> f64 {
+    let b = load_budget();
+    (b.daily_acu_max - b.spent_today).max(0.0)
+}
+
+fn acu_limit_for_act(act: &Value) -> f64 {
+    act.get("aux")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("acu_limit"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0)
+}
+
+fn budget_exhausted_ghost(url: &str, key: &str, box_id: &str, act: &Value, remaining: f64, needed: f64) {
+    let original_hash = act
+        .get("content_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let mut extra = serde_json::Map::new();
+    extra.insert("original_hash".into(), Value::String(original_hash.into()));
+    extra.insert(
+        "remaining_acu".into(),
+        Value::Number(serde_json::Number::from_f64(remaining).unwrap_or_else(|| 0.into())),
+    );
+    extra.insert(
+        "needed_acu".into(),
+        Value::Number(serde_json::Number::from_f64(needed).unwrap_or_else(|| 0.into())),
+    );
+    let (receipt, c_hash, t_hash) = canonical_receipt(
+        box_id,
+        "budget_exhausted",
+        original_hash,
+        &clock::now_rfc3339(),
+        "lab-executor",
+        "",
+        "",
+        "",
+        "ghost",
+        Some(extra),
+    );
+    let row = act_row(&receipt, &c_hash, &t_hash);
+    let _ = write_act_row(url, key, &row);
+}
+
+fn record_acu_spent(amount: f64) {
+    let mut b = load_budget();
+    b.spent_today += amount;
+    save_budget(&b);
+}
+
+fn cmd_budget() {
+    let b = load_budget();
+    println!("daily_acu_max: {}", b.daily_acu_max);
+    println!("spent_today:   {}", b.spent_today);
+    println!(
+        "remaining:     {}",
+        (b.daily_acu_max - b.spent_today).max(0.0)
+    );
+    println!("last_reset:    {}", b.last_reset);
+    println!("reset_hour:    {} UTC", b.reset_hour_utc);
+}
+
+// --- MCP server (read-only) -------------------------------------------------
+
+/// Run the Lab CLI as an MCP server over stdio.
+/// Exposes read-only tools so Devin Desktop/Web can query the Lab ledger
+/// without running up ACU charges. This is the free bridge to the web UI.
+fn cmd_mcp_server(url: &str, key: &str, read_only: bool) {
+    use serde_json::json;
+    use std::io::{self, BufRead, Write};
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut line = String::new();
+
+    eprintln!(
+        "lab mcp server started (read_only={}). Waiting for JSON-RPC on stdio...",
+        read_only
+    );
+
+    loop {
+        line.clear();
+        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let req: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = writeln!(
+                    stdout,
+                    "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":-32700,\"message\":\"Parse error\"}}}}"
+                );
+                continue;
+            }
+        };
+
+        let id = req.get("id").cloned().unwrap_or(Value::Null);
+        let method = req
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let resp: Value = match method {
+            "initialize" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "lab", "version": "0.2.0" }
+                }
+            }),
+            "tools/list" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "lab.read",
+                            "description": "Read rows from the Lab ledger (logline_acts). Accepts a PostgREST query string.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "query": { "type": "string", "description": "PostgREST query, e.g. did=eq.heartbeat&limit=10" }
+                                }
+                            }
+                        },
+                        {
+                            "name": "lab.tail",
+                            "description": "Return the last n acts from the Lab ledger.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "n": { "type": "integer", "description": "Number of rows (default 20)" }
+                                }
+                            }
+                        },
+                        {
+                            "name": "lab.clock_now",
+                            "description": "Return the current Lab UTC clock time.",
+                            "inputSchema": { "type": "object", "properties": {} }
+                        },
+                        {
+                            "name": "lab.budget",
+                            "description": "Return the local ACU budget state.",
+                            "inputSchema": { "type": "object", "properties": {} }
+                        },
+                        {
+                            "name": "lab.queue",
+                            "description": "List the local execution queue.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "n": { "type": "integer", "description": "Number of items (default 20)" }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }),
+            "tools/call" => {
+                let empty_params = serde_json::Map::new();
+                let params = req.get("params").and_then(|v| v.as_object()).unwrap_or(&empty_params);
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let args = params.get("arguments").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                let result = match name {
+                    "lab.read" => {
+                        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("limit=20");
+                        let body = rest_read(url, key, LEDGER, query);
+                        serde_json::from_str::<Value>(&body).unwrap_or(Value::String(body))
+                    }
+                    "lab.tail" => {
+                        let n = args.get("n").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                        let mut rows: Vec<Value> = Vec::new();
+                        let body = rest_read(url, key, LEDGER, "order=inserted_at.desc&limit=200");
+                        if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(&body) {
+                            for (i, row) in a.iter().enumerate() {
+                                if i >= n {
+                                    break;
+                                }
+                                rows.push(row.clone());
+                            }
+                        }
+                        Value::Array(rows)
+                    }
+                    "lab.clock_now" => Value::String(clock::now_rfc3339()),
+                    "lab.budget" => {
+                        let b = load_budget();
+                        budget_to_value(&b)
+                    }
+                    "lab.queue" => {
+                        let n = args.get("n").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                        let mut entries: Vec<String> = Vec::new();
+                        if let Ok(rd) = fs::read_dir(queue_dir()) {
+                            for e in rd.flatten() {
+                                entries.push(e.file_name().to_string_lossy().to_string());
+                            }
+                        }
+                        entries.sort();
+                        let limit = if n == 0 { entries.len() } else { n.min(entries.len()) };
+                        Value::Array(entries.into_iter().take(limit).map(Value::String).collect())
+                    }
+                    _ => json!({"error": "unknown tool"}),
+                };
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]
+                    }
+                })
+            }
+            _ => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": "Method not found" }
+            }),
+        };
+
+        if let Ok(s) = serde_json::to_string(&resp) {
+            let _ = writeln!(stdout, "{}", s);
+            let _ = stdout.flush();
+        }
+    }
 }
 
 fn json_escape(s: &str) -> String {
@@ -1677,7 +2550,7 @@ fn scaffold_command(name: &str) {
          # Golden rule of the LAB: do ALL Supabase I/O through the kernel ($LAB).\n\
          # Never hold creds, never reimplement the ledger -- call lab:\n\
          #   \"$LAB\" emit {name} <this> [data]      register an act (auto who/when, auto-hashed)\n\
-         #   \"$LAB\" read lab_log \"did=eq.{name}\"    read your acts back\n\
+         #   \"$LAB\" read logline_acts \"did=eq.{name}\"    read your acts back\n\
          #   \"$LAB\" tail 10                        peek the journal\n\
          set -euo pipefail\n\
          LAB=\"${{LAB_BIN:-lab}}\"\n\
@@ -1736,7 +2609,7 @@ fn usage() {
          \x20 lab emit <did> <this> [data] [--status s]  register an act (auto who/when, auto-hashed)\n\
          \x20 lab read  <table> [query]     read rows (PostgREST query, e.g. 'who=eq.lab-256')\n\
          \x20 lab write <table> <json>      insert a row (auto-hashed, jcs-rfc8785)\n\
-         \x20 lab heartbeat [this]          write a canon-shaped heartbeat to lab_log\n\
+         \x20 lab heartbeat [this]          write a canon-shaped heartbeat to logline_acts\n\
          \x20 lab scan [subject]            scan this box (wraps radar) -> hashed summary act\n\
          \x20 lab export                    scan every Radar phase, then write a raw full report\n\
          \x20 lab validate [export] [sha]   validate a Radar raw export + optional sidecar\n\
@@ -1744,8 +2617,13 @@ fn usage() {
          \x20 lab radar                     scan + judge + reach Dan only if critical (the per-box loop)\n\
          \x20 lab audit                     audit the 30 desired-state items (manhattan, read-only)\n\
          \x20 lab converge [--apply]        converge drift to desired state (plan; --apply mutates)\n\
-         \x20 lab manhattan-sync [n|--all]  admit Manhattan receipts into lab_log (compact, deduped)\n\
+         \x20 lab manhattan-sync [n|--all]  admit Manhattan receipts into logline_acts (compact, deduped)\n\
          \x20 lab tail [n]                  last n acts from the journal (default 20)\n\
+         \x20 lab clock tick|daemon|now|backfill  UTC ruler: queue due scheduled acts\n\
+         \x20 lab queue [n]                 list local execution queue\n\
+         \x20 lab executor run|daemon         consume queue and run devin sessions\n\
+         \x20 lab budget                    show local ACU budget state\n\
+         \x20 lab mcp [--read-only]          run as MCP server over stdio\n\
          \x20 lab ping                      is the ledger reachable, and how fast\n\
          \x20 lab whoami                    this box's identity (the 'who' it stamps)\n\
          \x20 lab notify <subject> [body]   email NOTIFY_TO (life-and-death only, 12h dedup)\n\
@@ -1834,7 +2712,7 @@ fn main() {
                 m.insert("data".into(), val);
             }
             let json = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
-            print!("{}", write_hashed(&url, &key, "lab_log", &json));
+            print!("{}", emit_legacy_json(&url, &key, &json));
         }
         "heartbeat" => {
             let (url, key) = load_creds();
@@ -1845,7 +2723,7 @@ fn main() {
                 json_escape(&this),
                 now_utc()
             );
-            print!("{}", write_hashed(&url, &key, "lab_log", &json));
+            print!("{}", emit_legacy_json(&url, &key, &json));
         }
         "hash" => {
             if rest.is_empty() {
@@ -1926,6 +2804,100 @@ fn main() {
         "manhattan-sync" => {
             let (url, key) = load_creds();
             cmd_manhattan_sync(&url, &key, rest);
+        }
+        "clock" => {
+            let (url, key) = load_creds();
+            let box_id = hostname();
+            if rest.is_empty() {
+                eprintln!("usage: lab clock tick|daemon|now|backfill --from <t> --to <t>");
+                exit(2);
+            }
+            match rest[0].as_str() {
+                "now" => println!("{}", clock::now_rfc3339()),
+                "tick" => {
+                    let n = cmd_clock_tick(&url, &key, &box_id);
+                    println!("queued {} act(s)", n);
+                }
+                "daemon" => {
+                    let tick = rest
+                        .get(1)
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(60);
+                    cmd_clock_daemon(&url, &key, &box_id, tick);
+                }
+                "backfill" => {
+                    let mut from = None;
+                    let mut to = None;
+                    let mut i = 1;
+                    while i < rest.len() {
+                        match rest[i].as_str() {
+                            "--from" => {
+                                from = rest.get(i + 1).cloned();
+                                i += 2;
+                            }
+                            "--to" => {
+                                to = rest.get(i + 1).cloned();
+                                i += 2;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    let (f, t) = match (from, to) {
+                        (Some(a), Some(b)) => (a, b),
+                        _ => {
+                            eprintln!("usage: lab clock backfill --from <RFC3339> --to <RFC3339>");
+                            exit(2);
+                        }
+                    };
+                    let n = cmd_clock_backfill(&url, &key, &box_id, &f, &t);
+                    println!("backfilled {} act(s)", n);
+                }
+                _ => {
+                    eprintln!("unknown lab clock subcommand: {}", rest[0]);
+                    exit(2);
+                }
+            }
+        }
+        "queue" => {
+            let n = rest
+                .first()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(20);
+            cmd_queue_list(n);
+        }
+        "executor" => {
+            let (url, key) = load_creds();
+            let box_id = hostname();
+            if rest.is_empty() {
+                eprintln!("usage: lab executor run|daemon [poll_seconds]");
+                exit(2);
+            }
+            match rest[0].as_str() {
+                "run" => {
+                    if !cmd_executor_run(&url, &key, &box_id) {
+                        exit(1);
+                    }
+                }
+                "daemon" => {
+                    let poll = rest
+                        .get(1)
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(10);
+                    cmd_executor_daemon(&url, &key, &box_id, poll);
+                }
+                _ => {
+                    eprintln!("unknown lab executor subcommand: {}", rest[0]);
+                    exit(2);
+                }
+            }
+        }
+        "budget" => {
+            cmd_budget();
+        }
+        "mcp" => {
+            let (url, key) = load_creds();
+            let read_only = rest.iter().any(|a| a == "--read-only" || a == "-r");
+            cmd_mcp_server(&url, &key, read_only);
         }
         "notify" => {
             if rest.is_empty() {
@@ -2111,6 +3083,11 @@ fn main() {
                 "audit",
                 "converge",
                 "manhattan-sync",
+                "clock",
+                "queue",
+                "executor",
+                "budget",
+                "mcp",
                 "hash",
                 "conformance",
                 "tail",
@@ -2161,7 +3138,7 @@ fn main() {
                 m.insert("when".into(), Value::String(now_utc()));
                 m.insert("status".into(), Value::String("created".into()));
                 let json = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
-                let _ = write_hashed(&url, &key, "lab_log", &json);
+                let _ = emit_legacy_json(&url, &key, &json);
             }
         }
         "help" | "-h" | "--help" => usage(),
