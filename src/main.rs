@@ -1985,13 +1985,14 @@ fn main() {
                     }
                 }
             }
-            let (did, this, to) = match (did, this, to) {
-                (Some(d), Some(t), Some(to)) => (d, t, to),
+            let (did, this) = match (did, this) {
+                (Some(d), Some(t)) => (d, t),
                 _ => {
-                    eprintln!("usage: lab send <did> <this> --to <hash>[,<hash>...] [--data <json>] [--as <who>] [--status <s>] [--if-not <x>] [--if-doubt <x>]");
+                    eprintln!("usage: lab send <did> <this> [--to <hash>[,<hash>...]] [--data <json>] [--as <who>] [--status <s>] [--if-not <x>] [--if-doubt <x>]");
                     exit(2);
                 }
             };
+            let to = to.unwrap_or_default();
             let (url, key) = load_creds();
             // Addressing rides in the canonical if_ok slot: comma-separated frequencies.
             let if_ok = to
