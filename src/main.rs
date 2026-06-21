@@ -1825,6 +1825,144 @@ fn main() {
             let body = rest.get(1).cloned().unwrap_or_else(|| subject.clone());
             cmd_notify(subject, &body);
         }
+        "send" => {
+            // lab send <did> <this> --to <hash>[,<hash>...] [--data <json>]
+            //          [--status <s>] [--as <who>] [--if-not <x>] [--if-doubt <x>]
+            // The canonical *addressed* write: emit + data.if_ok = [frequencies].
+            // A row whose if_ok carries real content-hashes is DELIVERED (the trigger
+            // taps each named channel). "send to johnny" still registers, wakes no one.
+            let (mut did, mut this) = (None, None);
+            let (mut to, mut data_arg, mut who_override) = (None, None, None);
+            let (mut if_not, mut if_doubt) = (None, None);
+            let mut status = "sent".to_string();
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--to" => {
+                        to = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--data" => {
+                        data_arg = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--status" => {
+                        status = rest.get(i + 1).cloned().unwrap_or(status);
+                        i += 2;
+                    }
+                    "--as" => {
+                        who_override = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--if-not" => {
+                        if_not = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--if-doubt" => {
+                        if_doubt = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    s => {
+                        if did.is_none() {
+                            did = Some(s.to_string());
+                        } else if this.is_none() {
+                            this = Some(s.to_string());
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            let (did, this, to) = match (did, this, to) {
+                (Some(d), Some(t), Some(to)) => (d, t, to),
+                _ => {
+                    eprintln!("usage: lab send <did> <this> --to <hash>[,<hash>...] [--data <json>] [--as <who>] [--status <s>] [--if-not <x>] [--if-doubt <x>]");
+                    exit(2);
+                }
+            };
+            let (url, key) = load_creds();
+            let if_ok: Vec<Value> = to
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| Value::String(s.to_string()))
+                .collect();
+            let mut data = serde_json::Map::new();
+            data.insert("if_ok".into(), Value::Array(if_ok));
+            if let Some(x) = if_not {
+                data.insert("if_not".into(), Value::String(x));
+            }
+            if let Some(x) = if_doubt {
+                data.insert("if_doubt".into(), Value::String(x));
+            }
+            if let Some(d) = data_arg {
+                let val = serde_json::from_str::<Value>(&d).unwrap_or(Value::String(d));
+                data.insert("payload".into(), val);
+            }
+            let mut m = serde_json::Map::new();
+            m.insert("who".into(), Value::String(who_override.unwrap_or_else(hostname)));
+            m.insert("did".into(), Value::String(did));
+            m.insert("this".into(), Value::String(this));
+            m.insert("when".into(), Value::String(now_utc()));
+            m.insert("status".into(), Value::String(status));
+            m.insert("data".into(), Value::Object(data));
+            let freq = content_hash(&strip_meta(&m));
+            let json = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
+            let resp = write_hashed(&url, &key, "lab_log", &json);
+            eprintln!("   sent · content_hash {}", freq);
+            print!("{}", resp);
+        }
+        "register" => {
+            // lab register <name> <data-json>   (data = {"kind":..,"wake":{..}})
+            // Writes an awaken-spec row and prints the resulting FREQUENCY (its
+            // content_hash) — the address others put in `--to` to reach this entity.
+            if rest.len() < 2 {
+                eprintln!("usage: lab register <name> <data-json>   (data = {{\"kind\":..,\"wake\":{{..}}}})");
+                exit(2);
+            }
+            let name = rest[0].clone();
+            let data_val = match serde_json::from_str::<Value>(&rest[1]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("lab register: invalid data JSON: {}", e);
+                    exit(2);
+                }
+            };
+            let (url, key) = load_creds();
+            let mut m = serde_json::Map::new();
+            m.insert("who".into(), Value::String(name.clone()));
+            m.insert("did".into(), Value::String("awaken-spec".into()));
+            m.insert("this".into(), Value::String(name));
+            m.insert("when".into(), Value::String(now_utc()));
+            m.insert("status".into(), Value::String("registered".into()));
+            m.insert("data".into(), data_val);
+            let freq = content_hash(&strip_meta(&m));
+            let json = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
+            let resp = write_hashed(&url, &key, "lab_log", &json);
+            println!("frequency: {}", freq);
+            eprint!("{}", resp);
+        }
+        "mine" => {
+            // lab mine <frequency> [limit]  -> rows addressed to this frequency
+            // (data.if_ok contains it). The cold-start / missed-tap pull; the receiver
+            // derives handled-ness from `awakened` receipts (the ledger is append-only).
+            if rest.is_empty() {
+                eprintln!("usage: lab mine <frequency-hash> [limit]");
+                exit(2);
+            }
+            let freq = &rest[0];
+            let limit = rest
+                .get(1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(50);
+            let (url, key) = load_creds();
+            let filter = format!("{{\"if_ok\":[\"{}\"]}}", freq);
+            let query = format!(
+                "data=cs.{}&order=inserted_at.desc&limit={}",
+                pct(&filter),
+                limit
+            );
+            print!("{}", rest_read(&url, &key, "lab_log", &query));
+        }
         "commands" | "list" => {
             let builtins = [
                 "read",
@@ -1846,6 +1984,9 @@ fn main() {
                 "ping",
                 "whoami",
                 "notify",
+                "send",
+                "register",
+                "mine",
                 "commands",
                 "new-command",
             ];
