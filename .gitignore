@@ -20,3 +20,5 @@ __pycache__/
 .claude/
 *.bak
 *.bak-*
+receiver/node_modules/
+ledger-backups/

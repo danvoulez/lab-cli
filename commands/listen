@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# lab command: listen -- the v3 receiver (the per-box "websocket server").
+#
+# Subscribes to logline_acts realtime; on a tap naming one of this box's
+# frequencies, reads the entity's wake-spec FROM THE LEDGER (not the message)
+# and dispatches the wake (deterministic verb, or inference via the membrane),
+# then writes an append-only `awakened` receipt. Idempotent.
+#
+# Frequencies this box owns: LAB_FREQUENCIES (comma-sep) or ~/.lab/frequencies.
+set -euo pipefail
+exec node "${LAB_RECEIVER:-$HOME/cli/receiver/listen.mjs}" "$@"

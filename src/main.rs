@@ -241,6 +241,119 @@ fn strip_meta(obj: &serde_json::Map<String, Value>) -> Value {
     Value::Object(m)
 }
 
+/// The one canonical table. Everything in LogLine form lands here.
+const LEDGER: &str = "logline_acts";
+
+/// Build a canonical `logline.receipt.v0` from the nine slots (all strings).
+/// Returns (act, content_hash, tuple_hash). Recipe (conformance-exact):
+///   tuple_hash   = sha256(jcs({the 9 slots}))
+///   content_hash = sha256(jcs(receipt − {id, hashes}))
+///   id           = content_hash
+/// jcs-rfc8785 sorts keys, so insertion order is irrelevant.
+#[allow(clippy::too_many_arguments)]
+fn canonical_receipt(
+    who: &str,
+    did: &str,
+    this: &str,
+    when: &str,
+    confirmed_by: &str,
+    if_ok: &str,
+    if_doubt: &str,
+    if_not: &str,
+    status: &str,
+    extra: Option<serde_json::Map<String, Value>>,
+) -> (Value, String, String) {
+    let slots = |m: &mut serde_json::Map<String, Value>| {
+        for (k, v) in [
+            ("who", who),
+            ("did", did),
+            ("this", this),
+            ("when", when),
+            ("confirmed_by", confirmed_by),
+            ("if_ok", if_ok),
+            ("if_doubt", if_doubt),
+            ("if_not", if_not),
+            ("status", status),
+        ] {
+            m.insert(k.into(), Value::String(v.into()));
+        }
+    };
+    // tuple_hash over the nine slots alone
+    let mut tuple = serde_json::Map::new();
+    slots(&mut tuple);
+    let tuple_hash = content_hash(&Value::Object(tuple));
+    // The receipt body, sans id/hashes. Canonical fields, then AUX (any extra
+    // top-level keys -- the DB projects `aux` = act minus the canonical fields).
+    // content_hash MUST cover the aux, so it is folded in BEFORE hashing.
+    let mut r = serde_json::Map::new();
+    r.insert(
+        "receipt_version".into(),
+        Value::String("logline.receipt.v0".into()),
+    );
+    slots(&mut r);
+    r.insert(
+        "json_canonicalization".into(),
+        Value::String("jcs-rfc8785".into()),
+    );
+    if let Some(ex) = extra {
+        // never let aux shadow a canonical/reserved/forbidden field
+        let reserved = [
+            "who",
+            "did",
+            "this",
+            "when",
+            "confirmed_by",
+            "if_ok",
+            "if_doubt",
+            "if_not",
+            "status",
+            "id",
+            "hashes",
+            "receipt_version",
+            "json_canonicalization",
+            "result",
+            "evidence",
+            "transport",
+        ];
+        for (k, v) in ex {
+            if !reserved.contains(&k.as_str()) {
+                r.insert(k, v);
+            }
+        }
+    }
+    let c_hash = content_hash(&Value::Object(r.clone()));
+    // mint id + hashes onto the full receipt
+    r.insert("id".into(), Value::String(c_hash.clone()));
+    let mut h = serde_json::Map::new();
+    h.insert("tuple_hash".into(), Value::String(tuple_hash.clone()));
+    h.insert("content_hash".into(), Value::String(c_hash.clone()));
+    h.insert("algorithm".into(), Value::String("sha256".into()));
+    r.insert("hashes".into(), Value::Object(h));
+    (Value::Object(r), c_hash, tuple_hash)
+}
+
+/// Assemble the `logline_acts` row: the `act` (truth) plus the three
+/// non-generated projection columns the CHECK constraints pin to it. The slots
+/// and `aux` are GENERATED from `act` by the database -- we never set them.
+fn act_row(receipt: &Value, content: &str, tuple: &str) -> Value {
+    let mut row = serde_json::Map::new();
+    row.insert("act".into(), receipt.clone());
+    row.insert("content_hash".into(), Value::String(content.into()));
+    row.insert("tuple_hash".into(), Value::String(tuple.into()));
+    row.insert(
+        "receipt_version".into(),
+        Value::String("logline.receipt.v0".into()),
+    );
+    Value::Object(row)
+}
+
+/// Post a fully-minted canonical row to the one ledger. No re-hashing, no
+/// meta-stamping -- the receipt is already canonical. Returns (body, code).
+fn write_act_row(url: &str, key: &str, row: &Value) -> (String, i64) {
+    let body = serde_json::to_string(row).unwrap_or_default();
+    rest_write_raw(url, key, LEDGER, &body)
+}
+
 /// Rust-compiler-style status. A write never "fails" -- like `cargo` it always
 /// reports Registered, with a [tier] tag saying how conformant it managed to be.
 /// (The one genuine error is an unreachable ledger -- we don't fake that green.)
@@ -1825,6 +1938,164 @@ fn main() {
             let body = rest.get(1).cloned().unwrap_or_else(|| subject.clone());
             cmd_notify(subject, &body);
         }
+        "send" => {
+            // lab send <did> <this> --to <hash>[,<hash>...] [--data <json>]
+            //          [--status <s>] [--as <who>] [--if-not <x>] [--if-doubt <x>]
+            // The canonical *addressed* write: emit + data.if_ok = [frequencies].
+            // A row whose if_ok carries real content-hashes is DELIVERED (the trigger
+            // taps each named channel). "send to johnny" still registers, wakes no one.
+            let (mut did, mut this) = (None, None);
+            let (mut to, mut data_arg, mut who_override) = (None, None, None);
+            let (mut if_not, mut if_doubt) = (None, None);
+            let mut status = "sent".to_string();
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--to" => {
+                        to = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--data" => {
+                        data_arg = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--status" => {
+                        status = rest.get(i + 1).cloned().unwrap_or(status);
+                        i += 2;
+                    }
+                    "--as" => {
+                        who_override = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--if-not" => {
+                        if_not = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--if-doubt" => {
+                        if_doubt = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    s => {
+                        if did.is_none() {
+                            did = Some(s.to_string());
+                        } else if this.is_none() {
+                            this = Some(s.to_string());
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            let (did, this) = match (did, this) {
+                (Some(d), Some(t)) => (d, t),
+                _ => {
+                    eprintln!("usage: lab send <did> <this> [--to <hash>[,<hash>...]] [--data <json>] [--as <who>] [--status <s>] [--if-not <x>] [--if-doubt <x>]");
+                    exit(2);
+                }
+            };
+            let to = to.unwrap_or_default();
+            let (url, key) = load_creds();
+            // Addressing rides in the canonical if_ok slot: comma-separated frequencies.
+            let if_ok = to
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            let who = who_override.unwrap_or_else(hostname);
+            let when = now_utc();
+            let extra = data_arg.map(|d| {
+                let payload = serde_json::from_str::<Value>(&d).unwrap_or(Value::String(d));
+                let mut a = serde_json::Map::new();
+                a.insert("payload".into(), payload);
+                a
+            });
+            let (receipt, c_hash, t_hash) = canonical_receipt(
+                &who,
+                &did,
+                &this,
+                &when,
+                "",
+                &if_ok,
+                &if_doubt.unwrap_or_default(),
+                &if_not.unwrap_or_default(),
+                &status,
+                extra,
+            );
+            let row = act_row(&receipt, &c_hash, &t_hash);
+            let (resp, code) = write_act_row(&url, &key, &row);
+            if !(200..300).contains(&code) {
+                eprintln!("lab send: ledger rejected (HTTP {}): {}", code, resp.trim());
+                exit(1);
+            }
+            eprintln!("   sent → logline_acts [canonical] {}", c_hash);
+            print!("{}", resp);
+        }
+        "register" => {
+            // lab register <name> <data-json>   (data = {"kind":..,"wake":{..}})
+            // Writes an awaken-spec row and prints the resulting FREQUENCY (its
+            // content_hash) — the address others put in `--to` to reach this entity.
+            if rest.len() < 2 {
+                eprintln!("usage: lab register <name> <data-json>   (data = {{\"kind\":..,\"wake\":{{..}}}})");
+                exit(2);
+            }
+            let name = rest[0].clone();
+            let data_val = match serde_json::from_str::<Value>(&rest[1]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("lab register: invalid data JSON: {}", e);
+                    exit(2);
+                }
+            };
+            let (url, key) = load_creds();
+            let when = now_utc();
+            // The wake-spec lives in AUX (extra info) -- folded into the act so the
+            // DB projects it into the aux column; never part of the nine slots.
+            let mut extra = serde_json::Map::new();
+            extra.insert("spec".into(), data_val);
+            let (receipt, c_hash, t_hash) = canonical_receipt(
+                &name,
+                "awaken-spec",
+                &name,
+                &when,
+                "",
+                "",
+                "",
+                "",
+                "registered",
+                Some(extra),
+            );
+            let row = act_row(&receipt, &c_hash, &t_hash);
+            let (resp, code) = write_act_row(&url, &key, &row);
+            if !(200..300).contains(&code) {
+                eprintln!("lab register: ledger rejected (HTTP {}): {}", code, resp.trim());
+                exit(1);
+            }
+            println!("frequency: {}", c_hash);
+            eprintln!("   registered → logline_acts [canonical] {}", c_hash);
+        }
+        "mine" => {
+            // lab mine <frequency> [limit]  -> rows addressed to this frequency
+            // (data.if_ok contains it). The cold-start / missed-tap pull; the receiver
+            // derives handled-ness from `awakened` receipts (the ledger is append-only).
+            if rest.is_empty() {
+                eprintln!("usage: lab mine <frequency-hash> [limit]");
+                exit(2);
+            }
+            let freq = &rest[0];
+            let limit = rest
+                .get(1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(50);
+            let (url, key) = load_creds();
+            // if_ok is the canonical addressing slot; a row names this frequency
+            // when its if_ok string contains the hash.
+            let query = format!(
+                "if_ok=ilike.*{}*&order=inserted_at.desc&limit={}",
+                pct(freq),
+                limit
+            );
+            print!("{}", rest_read(&url, &key, LEDGER, &query));
+        }
         "commands" | "list" => {
             let builtins = [
                 "read",
@@ -1846,6 +2117,9 @@ fn main() {
                 "ping",
                 "whoami",
                 "notify",
+                "send",
+                "register",
+                "mine",
                 "commands",
                 "new-command",
             ];
