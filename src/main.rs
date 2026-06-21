@@ -241,6 +241,119 @@ fn strip_meta(obj: &serde_json::Map<String, Value>) -> Value {
     Value::Object(m)
 }
 
+/// The one canonical table. Everything in LogLine form lands here.
+const LEDGER: &str = "logline_acts";
+
+/// Build a canonical `logline.receipt.v0` from the nine slots (all strings).
+/// Returns (act, content_hash, tuple_hash). Recipe (conformance-exact):
+///   tuple_hash   = sha256(jcs({the 9 slots}))
+///   content_hash = sha256(jcs(receipt − {id, hashes}))
+///   id           = content_hash
+/// jcs-rfc8785 sorts keys, so insertion order is irrelevant.
+#[allow(clippy::too_many_arguments)]
+fn canonical_receipt(
+    who: &str,
+    did: &str,
+    this: &str,
+    when: &str,
+    confirmed_by: &str,
+    if_ok: &str,
+    if_doubt: &str,
+    if_not: &str,
+    status: &str,
+    extra: Option<serde_json::Map<String, Value>>,
+) -> (Value, String, String) {
+    let slots = |m: &mut serde_json::Map<String, Value>| {
+        for (k, v) in [
+            ("who", who),
+            ("did", did),
+            ("this", this),
+            ("when", when),
+            ("confirmed_by", confirmed_by),
+            ("if_ok", if_ok),
+            ("if_doubt", if_doubt),
+            ("if_not", if_not),
+            ("status", status),
+        ] {
+            m.insert(k.into(), Value::String(v.into()));
+        }
+    };
+    // tuple_hash over the nine slots alone
+    let mut tuple = serde_json::Map::new();
+    slots(&mut tuple);
+    let tuple_hash = content_hash(&Value::Object(tuple));
+    // The receipt body, sans id/hashes. Canonical fields, then AUX (any extra
+    // top-level keys -- the DB projects `aux` = act minus the canonical fields).
+    // content_hash MUST cover the aux, so it is folded in BEFORE hashing.
+    let mut r = serde_json::Map::new();
+    r.insert(
+        "receipt_version".into(),
+        Value::String("logline.receipt.v0".into()),
+    );
+    slots(&mut r);
+    r.insert(
+        "json_canonicalization".into(),
+        Value::String("jcs-rfc8785".into()),
+    );
+    if let Some(ex) = extra {
+        // never let aux shadow a canonical/reserved/forbidden field
+        let reserved = [
+            "who",
+            "did",
+            "this",
+            "when",
+            "confirmed_by",
+            "if_ok",
+            "if_doubt",
+            "if_not",
+            "status",
+            "id",
+            "hashes",
+            "receipt_version",
+            "json_canonicalization",
+            "result",
+            "evidence",
+            "transport",
+        ];
+        for (k, v) in ex {
+            if !reserved.contains(&k.as_str()) {
+                r.insert(k, v);
+            }
+        }
+    }
+    let c_hash = content_hash(&Value::Object(r.clone()));
+    // mint id + hashes onto the full receipt
+    r.insert("id".into(), Value::String(c_hash.clone()));
+    let mut h = serde_json::Map::new();
+    h.insert("tuple_hash".into(), Value::String(tuple_hash.clone()));
+    h.insert("content_hash".into(), Value::String(c_hash.clone()));
+    h.insert("algorithm".into(), Value::String("sha256".into()));
+    r.insert("hashes".into(), Value::Object(h));
+    (Value::Object(r), c_hash, tuple_hash)
+}
+
+/// Assemble the `logline_acts` row: the `act` (truth) plus the three
+/// non-generated projection columns the CHECK constraints pin to it. The slots
+/// and `aux` are GENERATED from `act` by the database -- we never set them.
+fn act_row(receipt: &Value, content: &str, tuple: &str) -> Value {
+    let mut row = serde_json::Map::new();
+    row.insert("act".into(), receipt.clone());
+    row.insert("content_hash".into(), Value::String(content.into()));
+    row.insert("tuple_hash".into(), Value::String(tuple.into()));
+    row.insert(
+        "receipt_version".into(),
+        Value::String("logline.receipt.v0".into()),
+    );
+    Value::Object(row)
+}
+
+/// Post a fully-minted canonical row to the one ledger. No re-hashing, no
+/// meta-stamping -- the receipt is already canonical. Returns (body, code).
+fn write_act_row(url: &str, key: &str, row: &Value) -> (String, i64) {
+    let body = serde_json::to_string(row).unwrap_or_default();
+    rest_write_raw(url, key, LEDGER, &body)
+}
+
 /// Rust-compiler-style status. A write never "fails" -- like `cargo` it always
 /// reports Registered, with a [tier] tag saying how conformant it managed to be.
 /// (The one genuine error is an unreachable ledger -- we don't fake that green.)
@@ -1880,35 +1993,40 @@ fn main() {
                 }
             };
             let (url, key) = load_creds();
-            let if_ok: Vec<Value> = to
+            // Addressing rides in the canonical if_ok slot: comma-separated frequencies.
+            let if_ok = to
                 .split(',')
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
-                .map(|s| Value::String(s.to_string()))
-                .collect();
-            let mut data = serde_json::Map::new();
-            data.insert("if_ok".into(), Value::Array(if_ok));
-            if let Some(x) = if_not {
-                data.insert("if_not".into(), Value::String(x));
+                .collect::<Vec<_>>()
+                .join(",");
+            let who = who_override.unwrap_or_else(hostname);
+            let when = now_utc();
+            let extra = data_arg.map(|d| {
+                let payload = serde_json::from_str::<Value>(&d).unwrap_or(Value::String(d));
+                let mut a = serde_json::Map::new();
+                a.insert("payload".into(), payload);
+                a
+            });
+            let (receipt, c_hash, t_hash) = canonical_receipt(
+                &who,
+                &did,
+                &this,
+                &when,
+                "",
+                &if_ok,
+                &if_doubt.unwrap_or_default(),
+                &if_not.unwrap_or_default(),
+                &status,
+                extra,
+            );
+            let row = act_row(&receipt, &c_hash, &t_hash);
+            let (resp, code) = write_act_row(&url, &key, &row);
+            if !(200..300).contains(&code) {
+                eprintln!("lab send: ledger rejected (HTTP {}): {}", code, resp.trim());
+                exit(1);
             }
-            if let Some(x) = if_doubt {
-                data.insert("if_doubt".into(), Value::String(x));
-            }
-            if let Some(d) = data_arg {
-                let val = serde_json::from_str::<Value>(&d).unwrap_or(Value::String(d));
-                data.insert("payload".into(), val);
-            }
-            let mut m = serde_json::Map::new();
-            m.insert("who".into(), Value::String(who_override.unwrap_or_else(hostname)));
-            m.insert("did".into(), Value::String(did));
-            m.insert("this".into(), Value::String(this));
-            m.insert("when".into(), Value::String(now_utc()));
-            m.insert("status".into(), Value::String(status));
-            m.insert("data".into(), Value::Object(data));
-            let freq = content_hash(&strip_meta(&m));
-            let json = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
-            let resp = write_hashed(&url, &key, "lab_log", &json);
-            eprintln!("   sent · content_hash {}", freq);
+            eprintln!("   sent → logline_acts [canonical] {}", c_hash);
             print!("{}", resp);
         }
         "register" => {
@@ -1928,18 +2046,31 @@ fn main() {
                 }
             };
             let (url, key) = load_creds();
-            let mut m = serde_json::Map::new();
-            m.insert("who".into(), Value::String(name.clone()));
-            m.insert("did".into(), Value::String("awaken-spec".into()));
-            m.insert("this".into(), Value::String(name));
-            m.insert("when".into(), Value::String(now_utc()));
-            m.insert("status".into(), Value::String("registered".into()));
-            m.insert("data".into(), data_val);
-            let freq = content_hash(&strip_meta(&m));
-            let json = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
-            let resp = write_hashed(&url, &key, "lab_log", &json);
-            println!("frequency: {}", freq);
-            eprint!("{}", resp);
+            let when = now_utc();
+            // The wake-spec lives in AUX (extra info) -- folded into the act so the
+            // DB projects it into the aux column; never part of the nine slots.
+            let mut extra = serde_json::Map::new();
+            extra.insert("spec".into(), data_val);
+            let (receipt, c_hash, t_hash) = canonical_receipt(
+                &name,
+                "awaken-spec",
+                &name,
+                &when,
+                "",
+                "",
+                "",
+                "",
+                "registered",
+                Some(extra),
+            );
+            let row = act_row(&receipt, &c_hash, &t_hash);
+            let (resp, code) = write_act_row(&url, &key, &row);
+            if !(200..300).contains(&code) {
+                eprintln!("lab register: ledger rejected (HTTP {}): {}", code, resp.trim());
+                exit(1);
+            }
+            println!("frequency: {}", c_hash);
+            eprintln!("   registered → logline_acts [canonical] {}", c_hash);
         }
         "mine" => {
             // lab mine <frequency> [limit]  -> rows addressed to this frequency
@@ -1955,13 +2086,14 @@ fn main() {
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(50);
             let (url, key) = load_creds();
-            let filter = format!("{{\"if_ok\":[\"{}\"]}}", freq);
+            // if_ok is the canonical addressing slot; a row names this frequency
+            // when its if_ok string contains the hash.
             let query = format!(
-                "data=cs.{}&order=inserted_at.desc&limit={}",
-                pct(&filter),
+                "if_ok=ilike.*{}*&order=inserted_at.desc&limit={}",
+                pct(freq),
                 limit
             );
-            print!("{}", rest_read(&url, &key, "lab_log", &query));
+            print!("{}", rest_read(&url, &key, LEDGER, &query));
         }
         "commands" | "list" => {
             let builtins = [
