@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# lab command: greet   (auto-discovered by `lab` -- run: lab greet)
+# created 2026-06-20T14:01:18Z on lab-256
+#
+# Golden rule of the LAB: do ALL Supabase I/O through the kernel ($LAB).
+# Never hold creds, never reimplement the ledger -- call lab:
+#   "$LAB" emit greet <this> [data]      register an act (auto who/when, auto-hashed)
+#   "$LAB" read lab_log "did=eq.greet"    read your acts back
+#   "$LAB" tail 10                        peek the journal
+set -euo pipefail
+LAB="${LAB_BIN:-lab}"
+
+# --- your command starts here ------------------------------------------
+this="${1:-hello}"
+echo "lab greet: $*"
+"$LAB" emit greet "$this"

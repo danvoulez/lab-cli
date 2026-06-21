@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+
+# Built packages + local backups (shipped as GitHub Release assets, not committed)
+/dist/
+
+# Secrets / local creds — never commit (templates with .example are fine)
+*.env
+!*.env.example
+.notify.env
+sync.env
+.radar/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor / OS / session cruft
+.DS_Store
+.claude/
+*.bak
+*.bak-*

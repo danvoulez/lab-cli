@@ -1,0 +1,158 @@
+#!/bin/bash
+# radar-report.sh — Situation report for THIS box.
+# Live probes (Manhattan / MCP / UI) + ~/.radar inventory (crap by size).
+# No deps beyond macOS base (+ python3 if present, for inventory rollup).
+# Writes ~/.radar/report-<box>-<stamp>.md and prints it to stdout.
+#
+# Part of RADAR. Runs on each box (share-nothing). 8gb aggregates the fleet.
+set -u
+
+RADAR_DIR="$HOME/.radar"
+mkdir -p "$RADAR_DIR"
+BOX="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+FSTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+OUT="$RADAR_DIR/report-${BOX}-${FSTAMP}.md"
+
+# --- launchd helpers ---------------------------------------------------------
+svc_exit() { launchctl list 2>/dev/null | awk -v l="$1" '$3==l{print $2; f=1} END{if(!f)print "absent"}'; }
+
+http_code() { curl -s -m "${2:-4}" -o /dev/null -w '%{http_code}' "$1" 2>/dev/null || echo 000; }
+
+# --- headline: Manhattan -----------------------------------------------------
+MAN_A="$(svc_exit com.project-manhattan.agent)"
+MAN_D="$(svc_exit com.project-manhattan.daemon)"
+if [ "$MAN_A" != "absent" ] && [ "$MAN_D" != "absent" ]; then
+  MANHATTAN="WORKING — agent+daemon both loaded"
+elif [ "$MAN_A" != "absent" ]; then
+  MANHATTAN="**NOT WORKING (half)** — agent loaded, DAEMON NOT LOADED. Most of the 30 desired-state items (everything root-level: power, ssh, firewall, identity, restart) are NOT being enforced."
+elif [ "$MAN_D" != "absent" ]; then
+  MANHATTAN="**NOT WORKING (half)** — daemon loaded, agent missing. User-context items not enforced."
+else
+  MANHATTAN="**NOT WORKING** — neither agent nor daemon loaded."
+fi
+
+# --- headline: MCP Host Runtime ---------------------------------------------
+MCP_EXIT="$(svc_exit com.minilab.host-runtime)"
+MCP_HEALTH="$(http_code http://127.0.0.1:8788/health 3)"
+if [ "$MCP_HEALTH" = "200" ] || [ "$MCP_HEALTH" = "401" ]; then
+  MCP="WORKING — :8788 answering (HTTP $MCP_HEALTH)"
+elif [ "$MCP_EXIT" = "78" ]; then
+  MCP="**NOT WORKING** — launchd exit 78 (EX_CONFIG). Runtime never installed; plist points at a missing script. The package exists (mcp-openai-local-control / host-runtime v0.1.0) but was never deployed here."
+elif [ "$MCP_EXIT" = "absent" ]; then
+  MCP="**NOT WORKING** — job not loaded."
+else
+  MCP="**NOT WORKING** — last exit ${MCP_EXIT}, /health=${MCP_HEALTH}."
+fi
+
+# --- headline: UI / control --------------------------------------------------
+UI_CODE="$(http_code https://control.minilab.work 6)"
+if [ "$UI_CODE" = "200" ]; then
+  UI="WORKING — control.minilab.work serves (HTTP 200). NOTE: Radar tab not yet deployed there."
+else
+  UI="degraded — control.minilab.work returned HTTP ${UI_CODE}."
+fi
+
+# --- crap: all minilab/manhattan launchd jobs and their state ----------------
+JOBS="$(launchctl list 2>/dev/null | awk '$3 ~ /minilab|manhattan|santoandre/ {print $2"\t"$3}')"
+FAILING="$(printf '%s\n' "$JOBS" | awk -F'\t' '$1!="0" && $1!="-" && $1!="" {print "- `"$2"` — last exit **"$1"**"}')"
+RUNNING="$(printf '%s\n' "$JOBS" | awk -F'\t' '$1=="0" || $1=="-" {print "- `"$2"` — ok"}')"
+PLIST_COUNT="$(ls -1 "$HOME/Library/LaunchAgents"/*.plist 2>/dev/null | wc -l | tr -d ' ')"
+DISABLED_COUNT="$(ls -1 "$HOME/.disabled-launchagents"/*.plist 2>/dev/null | wc -l | tr -d ' ')"
+
+# --- inventory rollup from scan JSON (python3 if available) ------------------
+inventory_block() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "_python3 not present — inventory files are in ~/.radar/*.json_"
+    return
+  fi
+  python3 - "$RADAR_DIR" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+def human(n):
+    n = n or 0
+    for u in ("B","K","M","G","T"):
+        if n < 1024: return f"{n:.0f}{u}"
+        n /= 1024
+    return f"{n:.0f}P"
+def load(name):
+    p = os.path.join(d, name)
+    try:
+        with open(p) as f: return json.load(f)
+    except Exception: return None
+def top(subject, n=8):
+    j = load(subject + ".json")
+    if not j or "items" not in j: return None, None
+    items = [i for i in j["items"] if i.get("size_bytes")]
+    items.sort(key=lambda i: i.get("size_bytes") or 0, reverse=True)
+    cov = j.get("coverage", {})
+    return items[:n], cov
+for subj, title in (("storage","Storage hogs"),("junk","Junk / corpses (safe to delete)"),("apps","Apps"),("packages","Packages")):
+    items, cov = top(subj)
+    if items is None:
+        continue
+    csrc = (cov or {}).get("source","")
+    ccount = (cov or {}).get("count","")
+    print(f"\n### {title}  \n_source: {csrc} ({ccount} items)_\n")
+    if not items:
+        print("_(nothing with measurable size)_")
+        continue
+    for i in items:
+        print(f"- {human(i.get('size_bytes'))}  `{i.get('label','')}` {('— '+i['detail']) if i.get('detail') else ''}")
+PY
+}
+
+# --- assemble report ---------------------------------------------------------
+{
+echo "# RADAR — Situation Report"
+echo
+echo "**Box:** \`${BOX}\`  "
+echo "**Generated:** ${STAMP} (UTC)  "
+echo "**Source:** live launchd/HTTP probes + ~/.radar scan inventory. This file is generated BY Radar, not by a chat session."
+echo
+echo "---"
+echo
+echo "## Headline — the three systems"
+echo
+echo "| System | Status |"
+echo "|---|---|"
+echo "| **Manhattan** (self-healer) | ${MANHATTAN} |"
+echo "| **MCP Host Runtime** (the door) | ${MCP} |"
+echo "| **UI / control** | ${UI} |"
+echo
+echo "> Plain version: Manhattan ${MANHATTAN%% —*}; MCP ${MCP%% —*}; the UI is up."
+echo
+echo "---"
+echo
+echo "## Extra crap — running/loaded but failing or shouldn't be"
+echo
+echo "**Failing jobs (loaded, non-zero exit):**"
+echo
+if [ -n "$FAILING" ]; then printf '%s\n' "$FAILING"; else echo "_none failing right now_"; fi
+echo
+echo "**Loaded & ok (your live infra):**"
+echo
+if [ -n "$RUNNING" ]; then printf '%s\n' "$RUNNING"; else echo "_none_"; fi
+echo
+echo "**LaunchAgent plists on disk:** ${PLIST_COUNT} active, ${DISABLED_COUNT} parked in ~/.disabled-launchagents"
+echo
+echo "---"
+echo
+echo "## Inventory — what's eating the box"
+inventory_block
+echo
+echo "---"
+echo
+echo "## What to do (Dan decides; Radar executes)"
+echo
+echo "- **Fix MCP:** deploy the existing host-runtime v0.1.0 (\`deploy-local.sh\`). No code to write."
+echo "- **Fix Manhattan:** load the daemon so the 30 items are actually enforced."
+echo "- **Crap:** review the failing jobs above — disable or repair each."
+echo "- **Junk:** the 'safe to delete' pile above can be erased on your order."
+echo
+echo "_Report path: ${OUT}_"
+} | tee "$OUT"
+
+# plain-text twin
+cp "$OUT" "${OUT%.md}.txt" 2>/dev/null || true
+echo >&2 "[radar-report] wrote $OUT"

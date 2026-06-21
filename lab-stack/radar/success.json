@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "_doc": "RADAR success list = the SLOs. Each item defines what 'working' MEANS and the MANY WAYS Radar checks it. role: liveness (is the process alive -> restart if dead) vs readiness (is it actually serving/reachable -> don't restart, flag). view: whitebox (inspect innards) vs blackbox (symptom from outside). The engine never shows green without a passing check; if no method could run, the verdict is UNKNOWN, not OK.",
+  "items": [
+    {
+      "id": "mcp-host-runtime",
+      "name": "MCP Host Runtime (the door)",
+      "applies_to": ["lab-256", "lab-8gb", "lab-512"],
+      "checks": [
+        {"kind": "launchd", "label": "com.minilab.host-runtime", "role": "liveness", "view": "whitebox", "desc": "launchd job loaded and last exit 0"},
+        {"kind": "http", "url": "http://127.0.0.1:8788/health", "expect": [200, 401], "role": "readiness", "view": "whitebox", "desc": "answers on local port 8788"},
+        {"kind": "http", "url": "https://{PUB}.minilab.work/health", "expect": [200, 401], "role": "readiness", "view": "blackbox", "desc": "reachable through the public Cloudflare tunnel"}
+      ]
+    },
+    {
+      "id": "manhattan-agent",
+      "name": "Manhattan agent (user-context self-healer)",
+      "applies_to": ["lab-256", "lab-8gb", "lab-512"],
+      "checks": [
+        {"kind": "launchd", "label": "com.project-manhattan.agent", "role": "liveness", "view": "whitebox", "desc": "agent launchd job loaded and exit 0"}
+      ]
+    },
+    {
+      "id": "manhattan-daemon",
+      "name": "Manhattan daemon (root self-healer -- enforces most of the 30 items)",
+      "applies_to": ["lab-256", "lab-8gb", "lab-512"],
+      "checks": [
+        {"kind": "launchd", "label": "com.project-manhattan.daemon", "role": "liveness", "view": "whitebox", "desc": "root daemon launchd job loaded and exit 0"}
+      ]
+    },
+    {
+      "id": "radar-scanner",
+      "name": "Radar scanner (this box's own eye)",
+      "applies_to": ["lab-256", "lab-8gb", "lab-512"],
+      "checks": [
+        {"kind": "launchd", "label": "com.minilab.lab-radar", "role": "liveness", "view": "whitebox", "desc": "lab radar launchd job loaded and exit 0"},
+        {"kind": "file_fresh", "path": "~/.radar/status.json", "max_age_min": 30, "role": "readiness", "view": "whitebox", "desc": "scan status refreshed within 30 min"}
+      ]
+    },
+    {
+      "id": "ledger-heartbeat",
+      "name": "Heartbeat to the ledger (box is visible to the fleet)",
+      "applies_to": ["lab-256", "lab-8gb", "lab-512"],
+      "checks": [
+        {"kind": "command", "argv": ["lab", "ping"], "expect_codes": [0], "timeout": 12, "role": "readiness", "view": "whitebox", "desc": "lab can reach the ledger"}
+      ]
+    },
+    {
+      "id": "control-ui",
+      "name": "Control UI (control.minilab.work)",
+      "applies_to": ["lab-256", "lab-8gb", "lab-512"],
+      "checks": [
+        {"kind": "http", "url": "https://control.minilab.work", "expect": [200], "role": "readiness", "view": "blackbox", "desc": "control panel serves to the world"}
+      ]
+    },
+    {
+      "id": "ssh-door",
+      "name": "SSH remote login (port 22)",
+      "applies_to": ["lab-256", "lab-8gb", "lab-512"],
+      "checks": [
+        {"kind": "port", "host": "127.0.0.1", "port": 22, "role": "liveness", "view": "whitebox", "desc": "sshd listening on 22"}
+      ]
+    },
+    {
+      "id": "inference-node",
+      "name": "Inference (mistral.rs on :1234)",
+      "applies_to": ["lab-512", "lab-8gb"],
+      "checks": [
+        {"kind": "port", "host": "10.88.0.10", "port": 1234, "role": "liveness", "view": "whitebox", "desc": "inference port reachable over the cable"},
+        {"kind": "http", "url": "http://10.88.0.10:1234/v1/models", "expect": [200], "role": "readiness", "view": "blackbox", "desc": "inference actually answers HTTP"}
+      ]
+    },
+    {
+      "id": "disk-free",
+      "name": "Disk headroom",
+      "applies_to": ["lab-256", "lab-8gb", "lab-512"],
+      "checks": [
+        {"kind": "disk_free", "path": "/", "min_gb": 10, "role": "readiness", "view": "whitebox", "desc": "at least 10 GB free on /"}
+      ]
+    }
+  ]
+}

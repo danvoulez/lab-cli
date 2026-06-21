@@ -1,0 +1,8 @@
+#!/bin/bash
+# lab command: demo  (auto-discovered by `lab`)
+# Reuse the kernel for ALL Supabase I/O -- never reimplement:
+#   "$LAB" read  <table> [query]
+#   "$LAB" write <table> <json>
+set -euo pipefail
+LAB="${LAB_BIN:-lab}"
+echo "lab command 'demo' args: $*"
