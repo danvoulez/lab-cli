@@ -3002,6 +3002,118 @@ fn main() {
             eprintln!("   sent → logline_acts [canonical] {}", c_hash);
             print!("{}", resp);
         }
+        "schedule" => {
+            // lab schedule --at <RFC3339> <did> <this>
+            //     [--data <json>] [--box <box>] [--acu-limit <n>]
+            //     [--playbook-macro <m>] [--target-process <p>] [--idempotency-key <k>]
+            //     [--as <who>]
+            // Writes a status=scheduled act so the clock will queue it when due.
+            let (mut at, mut did, mut this) = (None, None, None);
+            let (mut data_arg, mut who_override, mut box_id) = (None, None, None);
+            let (mut acu_limit, mut playbook_macro, mut target_process, mut idempotency_key) =
+                (None, None, None, None);
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--at" => {
+                        at = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--data" => {
+                        data_arg = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--box" => {
+                        box_id = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--acu-limit" => {
+                        acu_limit = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--playbook-macro" => {
+                        playbook_macro = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--target-process" => {
+                        target_process = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--idempotency-key" => {
+                        idempotency_key = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--as" => {
+                        who_override = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    s => {
+                        if did.is_none() {
+                            did = Some(s.to_string());
+                        } else if this.is_none() {
+                            this = Some(s.to_string());
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            let (at, did, this) = match (at, did, this) {
+                (Some(a), Some(d), Some(t)) => (a, d, t),
+                _ => {
+                    eprintln!("usage: lab schedule --at <RFC3339> <did> <this> [--data <json>] [--box <box>] [--acu-limit <n>] [--playbook-macro <m>] [--target-process <p>] [--idempotency-key <k>] [--as <who>]");
+                    exit(2);
+                }
+            };
+            // Validate the time parses.
+            if clock::UtcInstant::parse(&at).is_err() {
+                eprintln!("lab schedule: invalid time '{}' (expected RFC3339, e.g. 2026-06-21T12:00:00Z)", at);
+                exit(2);
+            }
+            let (url, key) = load_creds();
+            let who = who_override.unwrap_or_else(hostname);
+            let mut extra = serde_json::Map::new();
+            if let Some(d) = data_arg {
+                let payload = serde_json::from_str::<Value>(&d).unwrap_or(Value::String(d));
+                extra.insert("payload".into(), payload);
+            }
+            if let Some(b) = box_id {
+                extra.insert("box".into(), Value::String(b));
+            }
+            if let Some(a) = acu_limit {
+                if let Ok(v) = a.parse::<f64>() {
+                    extra.insert("acu_limit".into(), Value::Number(serde_json::Number::from_f64(v).unwrap_or_else(|| 0.into())));
+                }
+            }
+            if let Some(p) = playbook_macro {
+                extra.insert("playbook_macro".into(), Value::String(p));
+            }
+            if let Some(p) = target_process {
+                extra.insert("target_process".into(), Value::String(p));
+            }
+            if let Some(k) = idempotency_key {
+                extra.insert("idempotency_key".into(), Value::String(k));
+            }
+            let (receipt, c_hash, t_hash) = canonical_receipt(
+                &who,
+                &did,
+                &this,
+                &at,
+                "",
+                "",
+                "",
+                "",
+                "scheduled",
+                Some(extra),
+            );
+            let row = act_row(&receipt, &c_hash, &t_hash);
+            let (resp, code) = write_act_row(&url, &key, &row);
+            if !(200..300).contains(&code) {
+                eprintln!("lab schedule: ledger rejected (HTTP {}): {}", code, resp.trim());
+                exit(1);
+            }
+            eprintln!("   scheduled → logline_acts [canonical] {} at {}", c_hash, at);
+            print!("{}", resp);
+        }
         "register" => {
             // lab register <name> <data-json>   (data = {"kind":..,"wake":{..}})
             // Writes an awaken-spec row and prints the resulting FREQUENCY (its
