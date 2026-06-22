@@ -69,3 +69,39 @@ any mutating/outbound verb · "the fleet is alive". Those come later, on this ra
 echo "<frequency>" > ~/.lab/frequencies
 LAB_BIN=/path/to/canonical/lab node receiver/listen.mjs    # or: lab listen
 ```
+
+---
+
+## Inference wake (v3 goblin) — added
+
+A second wake mode. The receiver stays a generic dispatcher; the goblin's brain lives
+entirely in its own `awaken-spec` (`receiver/specs/goblin.awaken-spec.json`).
+
+```json
+{ "wake": {
+    "mode": "inference",
+    "via": "membrane",
+    "base": "http://127.0.0.1:8790/v1",
+    "model": "default",
+    "schema": "goblin.route.v1",
+    "system": "<the slot-filling prompt>",
+    "decision_schema": { "...strict json_schema (the decode-time cage)..." },
+    "enum_guard": { "action": ["route","park"], "intent": ["ci_push","human_message","noise"] }
+} }
+```
+
+On a tap the receiver: reads the source payload (`aux.payload`, else `this`), POSTs it
+to the membrane (`base/chat/completions`) under the spec's strict `decision_schema`
+(so the model **cannot** decode an out-of-grammar field), retries once on a membrane
+error, then re-validates the decision against `enum_guard` (defense-in-depth) and
+records it. **No verb runs in v1 — the classification IS the receipt.**
+
+| status | meaning |
+|---|---|
+| `closed` | the model routed (decision in `aux.payload.decision`) |
+| `parked` | `action:"park"` — the model honestly abstained |
+| `refused` | `no-decision-schema`, or `out-of-grammar` (enum_guard rejected the field) |
+| `failed`  | the membrane errored twice (e.g. mistral.rs NaN-500 on degenerate input) |
+
+The receiver hardcodes none of this — `schema`, `system`, enums, model and endpoint
+all come from the spec. A different brain is a different spec, same receiver.

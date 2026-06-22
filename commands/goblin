@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# lab command: goblin -- v3 inbox brain (manage its wake-spec + read its decisions).
+#
+# In v3 the goblin is NOT a daemon or a poller. It is a registered ENTITY: an
+# inference awaken-spec on the ledger, woken by the per-box receiver (`lab listen`)
+# whenever a row's `if_ok` names the goblin's frequency. The membrane addresses every
+# inbound door message to that frequency, so the inbox breathes on its own.
+#
+# This command only manages that entity -- it never holds creds or reimplements the
+# ledger; all I/O goes through the kernel ($LAB). The wake-spec is the single source
+# of truth in receiver/specs/goblin.awaken-spec.json.
+#
+#   lab goblin register   write the awaken-spec, print the goblin's frequency
+#   lab goblin freq       print the goblin's current frequency (latest spec)
+#   lab goblin status [n] show the goblin's recent routing decisions (awakened receipts)
+set -euo pipefail
+LAB="${LAB_BIN:-lab}"
+
+# locate the wake-spec (env override, then dir-relative, then ~/cli layout)
+resolve_spec() {
+  local self d
+  for cand in \
+    "${GOBLIN_SPEC:-}" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/receiver/specs/goblin.awaken-spec.json" \
+    "$HOME/cli/receiver/specs/goblin.awaken-spec.json"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  return 1
+}
+
+cmd="${1:-help}"
+case "$cmd" in
+  register)
+    SPEC="$(resolve_spec)" || { echo "lab goblin: cannot find goblin.awaken-spec.json (set GOBLIN_SPEC)" >&2; exit 2; }
+    echo "lab goblin: registering wake-spec from $SPEC" >&2
+    "$LAB" register goblin "$(cat "$SPEC")"
+    echo "lab goblin: add the printed frequency to ~/.lab/frequencies on 8GB and point the membrane door at it (lab send inbox <src> --to <freq>)." >&2
+    ;;
+  freq)
+    "$LAB" read logline_acts "did=eq.awaken-spec&who=eq.goblin&order=inserted_at.desc&limit=1" \
+      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['content_hash'] if d else 'no goblin awaken-spec registered yet')"
+    ;;
+  status)
+    n="${2:-10}"
+    "$LAB" read logline_acts "did=eq.awakened&order=inserted_at.desc&limit=$n" \
+      | python3 -c "
+import sys, json
+rows = json.load(sys.stdin)
+for r in rows:
+    p = (r.get('aux') or {}).get('payload') or {}
+    if p.get('mode') != 'inference':
+        continue
+    dec = p.get('decision') or {}
+    print(f\"{r.get('status','?'):8} {str(r.get('this',''))[:12]}  {dec.get('action','')}/{dec.get('intent','')}  {str(dec.get('summary',''))[:60]}\")
+" || true
+    ;;
+  *)
+    echo "usage: lab goblin register | freq | status [n]" >&2
+    exit 2
+    ;;
+esac

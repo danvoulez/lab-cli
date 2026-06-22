@@ -1,0 +1,26 @@
+{
+  "kind": "engine",
+  "wake": {
+    "mode": "inference",
+    "via": "membrane",
+    "base": "http://127.0.0.1:8790/v1",
+    "model": "default",
+    "schema": "goblin.route.v1",
+    "grammar_version": "goblin-v3",
+    "system": "You are the LAB inbox goblin. Read the raw inbound request and return the decision JSON. Use action=route with the single best intent: ci_push = a git push / CI webhook; human_message = text meant for a person to read or act on; noise = health-check, probe, empty or meaningless request. If you cannot confidently classify it, use action=park. summary is one short line.",
+    "decision_schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "action":  { "type": "string", "enum": ["route", "park"] },
+        "intent":  { "type": "string", "enum": ["ci_push", "human_message", "noise"] },
+        "summary": { "type": "string" }
+      },
+      "required": ["action", "intent", "summary"]
+    },
+    "enum_guard": {
+      "action": ["route", "park"],
+      "intent": ["ci_push", "human_message", "noise"]
+    }
+  }
+}
