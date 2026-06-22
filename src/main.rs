@@ -1698,7 +1698,10 @@ fn run_reconcile_command(args: &[String]) {
         .env("LAB_BIN", self_bin)
         .status()
         .unwrap_or_else(|e| {
-            eprintln!("lab project reconcile: failed to run projections repo: {}", e);
+            eprintln!(
+                "lab project reconcile: failed to run projections repo: {}",
+                e
+            );
             exit(1);
         });
     exit(status.code().unwrap_or(1));
@@ -1775,11 +1778,15 @@ fn print_non_authoritative(doc: &Value) {
     println!("non_authoritative_projection: true");
     println!(
         "computed_at: {}",
-        doc.get("computed_at").and_then(|v| v.as_str()).unwrap_or("unknown")
+        doc.get("computed_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
     );
     println!(
         "projection: {}",
-        doc.get("projection").and_then(|v| v.as_str()).unwrap_or("unknown")
+        doc.get("projection")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
     );
 }
 
@@ -1798,7 +1805,9 @@ fn cmd_law(rest: &[String]) {
             let root_hash = value_path(&doc, &["baseline", "constitutional_root", "act_hash"])
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            let counts = doc.get("counts_by_new_classification").unwrap_or(&Value::Null);
+            let counts = doc
+                .get("counts_by_new_classification")
+                .unwrap_or(&Value::Null);
             println!("constitutional_root: {}", root);
             println!("constitutional_root_hash: {}", root_hash);
             println!(
@@ -1819,7 +1828,9 @@ fn cmd_law(rest: &[String]) {
             );
             println!(
                 "source_zip: {}",
-                doc.get("source_zip").and_then(|v| v.as_str()).unwrap_or("unknown")
+                doc.get("source_zip")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
             );
         }
         "gaps" => {
@@ -1828,7 +1839,10 @@ fn cmd_law(rest: &[String]) {
             println!("prioritized_gaps:");
             if let Some(items) = doc.get("decisions_needed").and_then(|v| v.as_array()) {
                 for (idx, item) in items.iter().enumerate() {
-                    let id = item.get("item_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let id = item
+                        .get("item_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
                     let reason = item.get("reason").and_then(|v| v.as_str()).unwrap_or("");
                     println!("{}. {} — {}", idx + 1, id, reason);
                 }
@@ -1894,7 +1908,10 @@ fn cmd_law(rest: &[String]) {
                     println!("{}", serde_json::to_string_pretty(&row).unwrap_or_default());
                 }
                 None => {
-                    eprintln!("lab law check: not found in latest reconciliation projection: {}", needle);
+                    eprintln!(
+                        "lab law check: not found in latest reconciliation projection: {}",
+                        needle
+                    );
                     exit(1);
                 }
             }
@@ -2039,16 +2056,40 @@ fn main() {
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
-                    "--aux" => { aux = rest.get(i + 1).cloned(); i += 2; }
-                    "--status" => { status = rest.get(i + 1).cloned().unwrap_or(status); i += 2; }
-                    "--as" => { who = rest.get(i + 1).cloned(); i += 2; }
-                    "--confirmed-by" => { confirmed_by = rest.get(i + 1).cloned().unwrap_or(confirmed_by); i += 2; }
-                    "--if-ok" => { if_ok = rest.get(i + 1).cloned().unwrap_or_default(); i += 2; }
-                    "--if-doubt" => { if_doubt = rest.get(i + 1).cloned().unwrap_or_default(); i += 2; }
-                    "--if-not" => { if_not = rest.get(i + 1).cloned().unwrap_or_default(); i += 2; }
+                    "--aux" => {
+                        aux = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--status" => {
+                        status = rest.get(i + 1).cloned().unwrap_or(status);
+                        i += 2;
+                    }
+                    "--as" => {
+                        who = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--confirmed-by" => {
+                        confirmed_by = rest.get(i + 1).cloned().unwrap_or(confirmed_by);
+                        i += 2;
+                    }
+                    "--if-ok" => {
+                        if_ok = rest.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--if-doubt" => {
+                        if_doubt = rest.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--if-not" => {
+                        if_not = rest.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
                     s => {
-                        if did.is_none() { did = Some(s.to_string()); }
-                        else if this.is_none() { this = Some(s.to_string()); }
+                        if did.is_none() {
+                            did = Some(s.to_string());
+                        } else if this.is_none() {
+                            this = Some(s.to_string());
+                        }
                         i += 1;
                     }
                 }
@@ -2397,7 +2438,11 @@ fn main() {
             let row = act_row(&receipt, &c_hash, &t_hash);
             let (resp, code) = write_act_row(&url, &key, &row);
             if !(200..300).contains(&code) {
-                eprintln!("lab register: ledger rejected (HTTP {}): {}", code, resp.trim());
+                eprintln!(
+                    "lab register: ledger rejected (HTTP {}): {}",
+                    code,
+                    resp.trim()
+                );
                 exit(1);
             }
             println!("frequency: {}", c_hash);
@@ -2567,7 +2612,10 @@ fn main() {
                 exit(2);
             }
             let (url, key) = load_creds();
-            let query = format!("did=eq.awakened&this=eq.{}&limit=1&select=content_hash", pct(&rest[0]));
+            let query = format!(
+                "did=eq.awakened&this=eq.{}&limit=1&select=content_hash",
+                pct(&rest[0])
+            );
             let out = rest_read(&url, &key, LEDGER, &query);
             let rows: Vec<Value> = serde_json::from_str(&out).unwrap_or_default();
             if rows.is_empty() {
@@ -2584,17 +2632,33 @@ fn main() {
             // --reason why it was refused (for refused)
             let (mut act_hash, mut freq) = (None::<String>, None::<String>);
             let mut status = "closed".to_string();
-            let (mut verb, mut result, mut reason) = (None::<String>, None::<String>, None::<String>);
+            let (mut verb, mut result, mut reason) =
+                (None::<String>, None::<String>, None::<String>);
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
-                    "--status" => { status = rest.get(i+1).cloned().unwrap_or(status); i += 2; }
-                    "--verb"   => { verb   = rest.get(i+1).cloned(); i += 2; }
-                    "--result" => { result = rest.get(i+1).cloned(); i += 2; }
-                    "--reason" => { reason = rest.get(i+1).cloned(); i += 2; }
+                    "--status" => {
+                        status = rest.get(i + 1).cloned().unwrap_or(status);
+                        i += 2;
+                    }
+                    "--verb" => {
+                        verb = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--result" => {
+                        result = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--reason" => {
+                        reason = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
                     s => {
-                        if act_hash.is_none() { act_hash = Some(s.to_string()); }
-                        else if freq.is_none() { freq = Some(s.to_string()); }
+                        if act_hash.is_none() {
+                            act_hash = Some(s.to_string());
+                        } else if freq.is_none() {
+                            freq = Some(s.to_string());
+                        }
                         i += 1;
                     }
                 }
@@ -2610,9 +2674,15 @@ fn main() {
             let when = now_utc();
             let mut extra = serde_json::Map::new();
             extra.insert("freq".into(), Value::String(freq.clone()));
-            if let Some(v) = verb   { extra.insert("verb".into(),   Value::String(v)); }
-            if let Some(r) = result { extra.insert("result".into(), Value::String(r)); }
-            if let Some(r) = reason { extra.insert("reason".into(), Value::String(r)); }
+            if let Some(v) = verb {
+                extra.insert("verb".into(), Value::String(v));
+            }
+            if let Some(r) = result {
+                extra.insert("result".into(), Value::String(r));
+            }
+            if let Some(r) = reason {
+                extra.insert("reason".into(), Value::String(r));
+            }
             let (receipt, c_hash, t_hash) = canonical_receipt(
                 &hostname(),
                 "awakened",
@@ -2628,7 +2698,11 @@ fn main() {
             let row = act_row(&receipt, &c_hash, &t_hash);
             let (resp, code) = write_act_row(&url, &key, &row);
             if !(200..300).contains(&code) {
-                eprintln!("lab wake-receipt: ledger rejected (HTTP {}): {}", code, resp.trim());
+                eprintln!(
+                    "lab wake-receipt: ledger rejected (HTTP {}): {}",
+                    code,
+                    resp.trim()
+                );
                 exit(1);
             }
             eprintln!("   wake-receipt → logline_acts [canonical] {}", c_hash);
