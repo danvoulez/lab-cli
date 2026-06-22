@@ -241,6 +241,119 @@ fn strip_meta(obj: &serde_json::Map<String, Value>) -> Value {
     Value::Object(m)
 }
 
+/// The one canonical table. Everything in LogLine form lands here.
+const LEDGER: &str = "logline_acts";
+
+/// Build a canonical `logline.receipt.v0` from the nine slots (all strings).
+/// Returns (act, content_hash, tuple_hash). Recipe (conformance-exact):
+///   tuple_hash   = sha256(jcs({the 9 slots}))
+///   content_hash = sha256(jcs(receipt − {id, hashes}))
+///   id           = content_hash
+/// jcs-rfc8785 sorts keys, so insertion order is irrelevant.
+#[allow(clippy::too_many_arguments)]
+fn canonical_receipt(
+    who: &str,
+    did: &str,
+    this: &str,
+    when: &str,
+    confirmed_by: &str,
+    if_ok: &str,
+    if_doubt: &str,
+    if_not: &str,
+    status: &str,
+    extra: Option<serde_json::Map<String, Value>>,
+) -> (Value, String, String) {
+    let slots = |m: &mut serde_json::Map<String, Value>| {
+        for (k, v) in [
+            ("who", who),
+            ("did", did),
+            ("this", this),
+            ("when", when),
+            ("confirmed_by", confirmed_by),
+            ("if_ok", if_ok),
+            ("if_doubt", if_doubt),
+            ("if_not", if_not),
+            ("status", status),
+        ] {
+            m.insert(k.into(), Value::String(v.into()));
+        }
+    };
+    // tuple_hash over the nine slots alone
+    let mut tuple = serde_json::Map::new();
+    slots(&mut tuple);
+    let tuple_hash = content_hash(&Value::Object(tuple));
+    // The receipt body, sans id/hashes. Canonical fields, then AUX (any extra
+    // top-level keys -- the DB projects `aux` = act minus the canonical fields).
+    // content_hash MUST cover the aux, so it is folded in BEFORE hashing.
+    let mut r = serde_json::Map::new();
+    r.insert(
+        "receipt_version".into(),
+        Value::String("logline.receipt.v0".into()),
+    );
+    slots(&mut r);
+    r.insert(
+        "json_canonicalization".into(),
+        Value::String("jcs-rfc8785".into()),
+    );
+    if let Some(ex) = extra {
+        // never let aux shadow a canonical/reserved/forbidden field
+        let reserved = [
+            "who",
+            "did",
+            "this",
+            "when",
+            "confirmed_by",
+            "if_ok",
+            "if_doubt",
+            "if_not",
+            "status",
+            "id",
+            "hashes",
+            "receipt_version",
+            "json_canonicalization",
+            "result",
+            "evidence",
+            "transport",
+        ];
+        for (k, v) in ex {
+            if !reserved.contains(&k.as_str()) {
+                r.insert(k, v);
+            }
+        }
+    }
+    let c_hash = content_hash(&Value::Object(r.clone()));
+    // mint id + hashes onto the full receipt
+    r.insert("id".into(), Value::String(c_hash.clone()));
+    let mut h = serde_json::Map::new();
+    h.insert("tuple_hash".into(), Value::String(tuple_hash.clone()));
+    h.insert("content_hash".into(), Value::String(c_hash.clone()));
+    h.insert("algorithm".into(), Value::String("sha256".into()));
+    r.insert("hashes".into(), Value::Object(h));
+    (Value::Object(r), c_hash, tuple_hash)
+}
+
+/// Assemble the `logline_acts` row: the `act` (truth) plus the three
+/// non-generated projection columns the CHECK constraints pin to it. The slots
+/// and `aux` are GENERATED from `act` by the database -- we never set them.
+fn act_row(receipt: &Value, content: &str, tuple: &str) -> Value {
+    let mut row = serde_json::Map::new();
+    row.insert("act".into(), receipt.clone());
+    row.insert("content_hash".into(), Value::String(content.into()));
+    row.insert("tuple_hash".into(), Value::String(tuple.into()));
+    row.insert(
+        "receipt_version".into(),
+        Value::String("logline.receipt.v0".into()),
+    );
+    Value::Object(row)
+}
+
+/// Post a fully-minted canonical row to the one ledger. No re-hashing, no
+/// meta-stamping -- the receipt is already canonical. Returns (body, code).
+fn write_act_row(url: &str, key: &str, row: &Value) -> (String, i64) {
+    let body = serde_json::to_string(row).unwrap_or_default();
+    rest_write_raw(url, key, LEDGER, &body)
+}
+
 /// Rust-compiler-style status. A write never "fails" -- like `cargo` it always
 /// reports Registered, with a [tier] tag saying how conformant it managed to be.
 /// (The one genuine error is an unreachable ledger -- we don't fake that green.)
@@ -1541,6 +1654,258 @@ fn json_escape(s: &str) -> String {
     o
 }
 
+fn projections_repo() -> PathBuf {
+    let path = env::var("LAB_PROJECTIONS_REPO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(home()).join("PROJECTIONS"));
+    if !path.join("scripts/project-lab.mjs").exists() {
+        eprintln!(
+            "lab: projections repo not found at {}. Set LAB_PROJECTIONS_REPO=/path/to/PROJECTIONS",
+            path.display()
+        );
+        exit(2);
+    }
+    path
+}
+
+fn run_projection_command(args: &[String]) {
+    let repo = projections_repo();
+    let self_bin = env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "lab".to_string());
+    let status = Command::new("node")
+        .arg("scripts/project-lab.mjs")
+        .args(args)
+        .current_dir(&repo)
+        .env("LAB_BIN", self_bin)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("lab project: failed to run projections repo: {}", e);
+            exit(1);
+        });
+    exit(status.code().unwrap_or(1));
+}
+
+fn run_reconcile_command(args: &[String]) {
+    let repo = projections_repo();
+    let self_bin = env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "lab".to_string());
+    let status = Command::new("node")
+        .arg("scripts/reconcile-rules.mjs")
+        .args(args)
+        .current_dir(&repo)
+        .env("LAB_BIN", self_bin)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("lab project reconcile: failed to run projections repo: {}", e);
+            exit(1);
+        });
+    exit(status.code().unwrap_or(1));
+}
+
+fn mongo_latest(collection: &str) -> Value {
+    if env::var("LAB_MONGO_URI").unwrap_or_default().is_empty() {
+        eprintln!("lab law: LAB_MONGO_URI is required to read projection maps");
+        exit(2);
+    }
+    let repo = projections_repo();
+    let script = r#"
+const collection = process.argv[1];
+const uri = process.env.LAB_MONGO_URI;
+if (!uri) {
+  console.error("LAB_MONGO_URI is required");
+  process.exit(2);
+}
+let MongoClient;
+try {
+  ({ MongoClient } = await import("mongodb"));
+} catch {
+  console.error("mongodb package is not installed in the projections repo. Run `npm install` there.");
+  process.exit(2);
+}
+const client = new MongoClient(uri);
+await client.connect();
+try {
+  const db = client.db(process.env.LAB_MONGO_DB || "santo_andre_lab");
+  const doc = await db.collection(collection).find({}).sort({ computed_at: -1 }).limit(1).next();
+  if (!doc) {
+    console.error(`projection collection has no documents: ${collection}`);
+    process.exit(3);
+  }
+  delete doc._id;
+  console.log(JSON.stringify(doc));
+} finally {
+  await client.close();
+}
+"#;
+    let out = Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .arg(collection)
+        .current_dir(&repo)
+        .output()
+        .unwrap_or_else(|e| {
+            eprintln!("lab law: failed to run node: {}", e);
+            exit(1);
+        });
+    if !out.status.success() {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        exit(out.status.code().unwrap_or(1));
+    }
+    serde_json::from_slice::<Value>(&out.stdout).unwrap_or_else(|e| {
+        eprintln!("lab law: projection JSON parse failed: {}", e);
+        exit(1);
+    })
+}
+
+fn value_path<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    let mut cur = v;
+    for key in keys {
+        cur = cur.get(*key)?;
+    }
+    Some(cur)
+}
+
+fn as_usize(v: Option<&Value>) -> usize {
+    v.and_then(|x| x.as_u64()).unwrap_or(0) as usize
+}
+
+fn print_non_authoritative(doc: &Value) {
+    println!("non_authoritative_projection: true");
+    println!(
+        "computed_at: {}",
+        doc.get("computed_at").and_then(|v| v.as_str()).unwrap_or("unknown")
+    );
+    println!(
+        "projection: {}",
+        doc.get("projection").and_then(|v| v.as_str()).unwrap_or("unknown")
+    );
+}
+
+fn cmd_law(rest: &[String]) {
+    if rest.is_empty() {
+        eprintln!("usage: lab law <current|gaps|graph|check> ...");
+        exit(2);
+    }
+    match rest[0].as_str() {
+        "current" => {
+            let doc = mongo_latest("lab_rule_reconciliation");
+            print_non_authoritative(&doc);
+            let root = value_path(&doc, &["baseline", "constitutional_root", "this"])
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let root_hash = value_path(&doc, &["baseline", "constitutional_root", "act_hash"])
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let counts = doc.get("counts_by_new_classification").unwrap_or(&Value::Null);
+            println!("constitutional_root: {}", root);
+            println!("constitutional_root_hash: {}", root_hash);
+            println!(
+                "active_v0_count: {}",
+                as_usize(counts.get("keep_active_v0"))
+            );
+            println!(
+                "candidate_needs_rulemaking_count: {}",
+                as_usize(counts.get("candidate_needs_rulemaking"))
+            );
+            println!(
+                "deprecated_legacy_count: {}",
+                as_usize(counts.get("deprecated_legacy"))
+            );
+            println!(
+                "conflict_count: {}",
+                as_usize(counts.get("conflict_needs_decision"))
+            );
+            println!(
+                "source_zip: {}",
+                doc.get("source_zip").and_then(|v| v.as_str()).unwrap_or("unknown")
+            );
+        }
+        "gaps" => {
+            let doc = mongo_latest("lab_rule_reconciliation");
+            print_non_authoritative(&doc);
+            println!("prioritized_gaps:");
+            if let Some(items) = doc.get("decisions_needed").and_then(|v| v.as_array()) {
+                for (idx, item) in items.iter().enumerate() {
+                    let id = item.get("item_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let reason = item.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                    println!("{}. {} — {}", idx + 1, id, reason);
+                }
+            }
+            for gap in [
+                "Status Code missing",
+                "Rulemaking Procedure missing",
+                "Current Custody Surface rule pending",
+                "Active Law Projection rule pending",
+                "Projection Code pending",
+                "Process Contract Code pending",
+                "lab_log destructive migration decision pending",
+                "CURRENT_RUNNABLE_PROCESSES.md route-to-Devin check pending",
+            ] {
+                println!("- {}", gap);
+            }
+        }
+        "graph" => {
+            let json = rest.iter().any(|arg| arg == "--json");
+            let doc = mongo_latest("lab_rule_graph");
+            if json {
+                println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+            } else {
+                print_non_authoritative(&doc);
+                println!(
+                    "node_count: {}",
+                    as_usize(value_path(&doc, &["summary", "node_count"]))
+                );
+                println!(
+                    "edge_count: {}",
+                    as_usize(value_path(&doc, &["summary", "edge_count"]))
+                );
+            }
+        }
+        "check" => {
+            if rest.len() < 2 {
+                eprintln!("usage: lab law check <hash_or_rule_id>");
+                exit(2);
+            }
+            let needle = &rest[1];
+            let doc = mongo_latest("lab_rule_reconciliation");
+            let rows = doc
+                .get("reconciliation_matrix")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let found = rows.into_iter().find(|row| {
+                for key in ["item_id", "act_hash", "rule_id", "file"] {
+                    if row
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == needle || s.starts_with(needle))
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+                }
+                false
+            });
+            match found {
+                Some(row) => {
+                    print_non_authoritative(&doc);
+                    println!("{}", serde_json::to_string_pretty(&row).unwrap_or_default());
+                }
+                None => {
+                    eprintln!("lab law check: not found in latest reconciliation projection: {}", needle);
+                    exit(1);
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: lab law <current|gaps|graph|check> ...");
+            exit(2);
+        }
+    }
+}
+
 fn scaffold_command(name: &str) {
     let dir = commands_dir();
     if let Err(e) = fs::create_dir_all(&dir) {
@@ -1620,6 +1985,7 @@ fn usage() {
     println!(
         "lab — minilab CLI (the one Supabase I/O path)\n\n\
          usage:\n\
+         \x20 lab act <did> <this> [--aux <json>] [--status s]  write a canonical LogLine act to logline_acts\n\
          \x20 lab emit <did> <this> [data] [--status s]  register an act (auto who/when, auto-hashed)\n\
          \x20 lab read  <table> [query]     read rows (PostgREST query, e.g. 'who=eq.lab-256')\n\
          \x20 lab write <table> <json>      insert a row (auto-hashed, jcs-rfc8785)\n\
@@ -1638,6 +2004,11 @@ fn usage() {
          \x20 lab notify <subject> [body]   email NOTIFY_TO (life-and-death only, 12h dedup)\n\
          \x20 lab hash <json>               print the JCS-RFC8785 + sha256 content hash\n\
          \x20 lab conformance <json>        verdict on a row (warns, never blocks)\n\
+         \x20 lab wake-spec <freq>              read aux.spec of registered entity at that frequency\n\
+         \x20 lab wake-handled <act_hash>       exit 0 if awakened receipt exists, 1 if not\n\
+         \x20 lab wake-receipt <act_hash> <freq> --status <s> [--verb <v>] [--result <r>] [--reason <r>]  write awakened receipt\n\
+         \x20 lab project <all|law|reconcile>   call Santo-Andre-Laboratory/PROJECTIONS wrappers\n\
+         \x20 lab law <current|gaps|graph|check> read non-authoritative law projections\n\
          \x20 lab commands                  list builtins + discovered plugins\n\
          \x20 lab new-command <name>        scaffold <lab-root>/commands/<name>\n\
          \x20 lab <name> [args]             run <lab-root>/commands/<name>"
@@ -1653,6 +2024,78 @@ fn main() {
     let cmd = args[0].as_str();
     let rest = &args[1..];
     match cmd {
+        "act" => {
+            // lab act <did> <this> [--aux <json>] [--status <s>] [--as <who>]
+            //         [--confirmed-by <x>] [--if-ok <x>] [--if-doubt <x>] [--if-not <x>]
+            // Generic canonical evidence/custody write. Not a law declaration command.
+            let (mut did, mut this) = (None::<String>, None::<String>);
+            let mut aux = None::<String>;
+            let mut status = "claimed".to_string();
+            let mut who = None::<String>;
+            let mut confirmed_by = "lab-cli".to_string();
+            let mut if_ok = String::new();
+            let mut if_doubt = String::new();
+            let mut if_not = String::new();
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--aux" => { aux = rest.get(i + 1).cloned(); i += 2; }
+                    "--status" => { status = rest.get(i + 1).cloned().unwrap_or(status); i += 2; }
+                    "--as" => { who = rest.get(i + 1).cloned(); i += 2; }
+                    "--confirmed-by" => { confirmed_by = rest.get(i + 1).cloned().unwrap_or(confirmed_by); i += 2; }
+                    "--if-ok" => { if_ok = rest.get(i + 1).cloned().unwrap_or_default(); i += 2; }
+                    "--if-doubt" => { if_doubt = rest.get(i + 1).cloned().unwrap_or_default(); i += 2; }
+                    "--if-not" => { if_not = rest.get(i + 1).cloned().unwrap_or_default(); i += 2; }
+                    s => {
+                        if did.is_none() { did = Some(s.to_string()); }
+                        else if this.is_none() { this = Some(s.to_string()); }
+                        i += 1;
+                    }
+                }
+            }
+            let (did, this) = match (did, this) {
+                (Some(d), Some(t)) => (d, t),
+                _ => {
+                    eprintln!("usage: lab act <did> <this> [--aux <json>] [--status <s>]");
+                    exit(2);
+                }
+            };
+            let extra = match aux {
+                Some(raw) => match serde_json::from_str::<Value>(&raw) {
+                    Ok(Value::Object(map)) => Some(map),
+                    Ok(_) => {
+                        eprintln!("lab act: --aux must be a JSON object");
+                        exit(2);
+                    }
+                    Err(e) => {
+                        eprintln!("lab act: invalid --aux JSON: {}", e);
+                        exit(2);
+                    }
+                },
+                None => None,
+            };
+            let (url, key) = load_creds();
+            let (receipt, c_hash, t_hash) = canonical_receipt(
+                &who.unwrap_or_else(hostname),
+                &did,
+                &this,
+                &now_utc(),
+                &confirmed_by,
+                &if_ok,
+                &if_doubt,
+                &if_not,
+                &status,
+                extra,
+            );
+            let row = act_row(&receipt, &c_hash, &t_hash);
+            let (resp, code) = write_act_row(&url, &key, &row);
+            if !(200..300).contains(&code) {
+                eprintln!("lab act: ledger rejected (HTTP {}): {}", code, resp.trim());
+                exit(1);
+            }
+            eprintln!("   act → logline_acts [canonical] {}", c_hash);
+            print!("{}", resp);
+        }
         "read" => {
             if rest.is_empty() {
                 eprintln!("usage: lab read <table> [query]");
@@ -1825,8 +2268,167 @@ fn main() {
             let body = rest.get(1).cloned().unwrap_or_else(|| subject.clone());
             cmd_notify(subject, &body);
         }
+        "send" => {
+            // lab send <did> <this> --to <hash>[,<hash>...] [--data <json>]
+            //          [--status <s>] [--as <who>] [--if-not <x>] [--if-doubt <x>]
+            // The canonical *addressed* write: emit + data.if_ok = [frequencies].
+            // A row whose if_ok carries real content-hashes is DELIVERED (the trigger
+            // taps each named channel). "send to johnny" still registers, wakes no one.
+            let (mut did, mut this) = (None, None);
+            let (mut to, mut data_arg, mut who_override) = (None, None, None);
+            let (mut if_not, mut if_doubt) = (None, None);
+            let mut status = "sent".to_string();
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--to" => {
+                        to = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--data" => {
+                        data_arg = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--status" => {
+                        status = rest.get(i + 1).cloned().unwrap_or(status);
+                        i += 2;
+                    }
+                    "--as" => {
+                        who_override = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--if-not" => {
+                        if_not = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--if-doubt" => {
+                        if_doubt = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    s => {
+                        if did.is_none() {
+                            did = Some(s.to_string());
+                        } else if this.is_none() {
+                            this = Some(s.to_string());
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            let (did, this) = match (did, this) {
+                (Some(d), Some(t)) => (d, t),
+                _ => {
+                    eprintln!("usage: lab send <did> <this> [--to <hash>[,<hash>...]] [--data <json>] [--as <who>] [--status <s>] [--if-not <x>] [--if-doubt <x>]");
+                    exit(2);
+                }
+            };
+            let to = to.unwrap_or_default();
+            let (url, key) = load_creds();
+            // Addressing rides in the canonical if_ok slot: comma-separated frequencies.
+            let if_ok = to
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            let who = who_override.unwrap_or_else(hostname);
+            let when = now_utc();
+            let extra = data_arg.map(|d| {
+                let payload = serde_json::from_str::<Value>(&d).unwrap_or(Value::String(d));
+                let mut a = serde_json::Map::new();
+                a.insert("payload".into(), payload);
+                a
+            });
+            let (receipt, c_hash, t_hash) = canonical_receipt(
+                &who,
+                &did,
+                &this,
+                &when,
+                "",
+                &if_ok,
+                &if_doubt.unwrap_or_default(),
+                &if_not.unwrap_or_default(),
+                &status,
+                extra,
+            );
+            let row = act_row(&receipt, &c_hash, &t_hash);
+            let (resp, code) = write_act_row(&url, &key, &row);
+            if !(200..300).contains(&code) {
+                eprintln!("lab send: ledger rejected (HTTP {}): {}", code, resp.trim());
+                exit(1);
+            }
+            eprintln!("   sent → logline_acts [canonical] {}", c_hash);
+            print!("{}", resp);
+        }
+        "register" => {
+            // lab register <name> <data-json>   (data = {"kind":..,"wake":{..}})
+            // Writes an awaken-spec row and prints the resulting FREQUENCY (its
+            // content_hash) — the address others put in `--to` to reach this entity.
+            if rest.len() < 2 {
+                eprintln!("usage: lab register <name> <data-json>   (data = {{\"kind\":..,\"wake\":{{..}}}})");
+                exit(2);
+            }
+            let name = rest[0].clone();
+            let data_val = match serde_json::from_str::<Value>(&rest[1]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("lab register: invalid data JSON: {}", e);
+                    exit(2);
+                }
+            };
+            let (url, key) = load_creds();
+            let when = now_utc();
+            // The wake-spec lives in AUX (extra info) -- folded into the act so the
+            // DB projects it into the aux column; never part of the nine slots.
+            let mut extra = serde_json::Map::new();
+            extra.insert("spec".into(), data_val);
+            let (receipt, c_hash, t_hash) = canonical_receipt(
+                &name,
+                "awaken-spec",
+                &name,
+                &when,
+                "",
+                "",
+                "",
+                "",
+                "registered",
+                Some(extra),
+            );
+            let row = act_row(&receipt, &c_hash, &t_hash);
+            let (resp, code) = write_act_row(&url, &key, &row);
+            if !(200..300).contains(&code) {
+                eprintln!("lab register: ledger rejected (HTTP {}): {}", code, resp.trim());
+                exit(1);
+            }
+            println!("frequency: {}", c_hash);
+            eprintln!("   registered → logline_acts [canonical] {}", c_hash);
+        }
+        "mine" => {
+            // lab mine <frequency> [limit]  -> rows addressed to this frequency
+            // (data.if_ok contains it). The cold-start / missed-tap pull; the receiver
+            // derives handled-ness from `awakened` receipts (the ledger is append-only).
+            if rest.is_empty() {
+                eprintln!("usage: lab mine <frequency-hash> [limit]");
+                exit(2);
+            }
+            let freq = &rest[0];
+            let limit = rest
+                .get(1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(50);
+            let (url, key) = load_creds();
+            // if_ok is the canonical addressing slot; a row names this frequency
+            // when its if_ok string contains the hash.
+            let query = format!(
+                "if_ok=ilike.*{}*&order=inserted_at.desc&limit={}",
+                pct(freq),
+                limit
+            );
+            print!("{}", rest_read(&url, &key, LEDGER, &query));
+        }
         "commands" | "list" => {
             let builtins = [
+                "act",
                 "read",
                 "write",
                 "emit",
@@ -1846,6 +2448,14 @@ fn main() {
                 "ping",
                 "whoami",
                 "notify",
+                "wake-spec",
+                "wake-handled",
+                "wake-receipt",
+                "project",
+                "law",
+                "send",
+                "register",
+                "mine",
                 "commands",
                 "new-command",
             ];
@@ -1871,6 +2481,38 @@ fn main() {
                 println!("  {}", p);
             }
         }
+        "project" => {
+            if rest.is_empty() {
+                eprintln!("usage: lab project <all|law|docs|weekly|processes|current-state|reconcile> ...");
+                exit(2);
+            }
+            match rest[0].as_str() {
+                "all" => run_projection_command(&["all".to_string()]),
+                "law" => run_projection_command(&["law".to_string()]),
+                "docs" => run_projection_command(&["docs".to_string()]),
+                "weekly" => run_projection_command(&["weekly".to_string()]),
+                "processes" => run_projection_command(&["processes".to_string()]),
+                "current-state" => run_projection_command(&["current-state".to_string()]),
+                "reconcile" => {
+                    let mut args = Vec::new();
+                    if rest.len() == 1 {
+                        eprintln!("usage: lab project reconcile --zip <zip-path> [--dry-run]");
+                        exit(2);
+                    }
+                    for arg in &rest[1..] {
+                        args.push(arg.clone());
+                    }
+                    run_reconcile_command(&args);
+                }
+                _ => {
+                    eprintln!("usage: lab project <all|law|docs|weekly|processes|current-state|reconcile> ...");
+                    exit(2);
+                }
+            }
+        }
+        "law" => {
+            cmd_law(rest);
+        }
         "new-command" => {
             if rest.is_empty() {
                 eprintln!("usage: lab new-command <name>");
@@ -1889,6 +2531,108 @@ fn main() {
                 let json = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
                 let _ = write_hashed(&url, &key, "lab_log", &json);
             }
+        }
+        "wake-spec" => {
+            // lab wake-spec <freq>
+            // Reads aux.spec of the entity registered at that frequency.
+            // Prints the spec JSON to stdout. Exit 1 if not found.
+            if rest.is_empty() {
+                eprintln!("usage: lab wake-spec <freq>");
+                exit(2);
+            }
+            let (url, key) = load_creds();
+            let query = format!("content_hash=eq.{}&select=aux", pct(&rest[0]));
+            let out = rest_read(&url, &key, LEDGER, &query);
+            let rows: Vec<Value> = serde_json::from_str(&out).unwrap_or_default();
+            match rows.into_iter().next().and_then(|r| r.get("aux").cloned()) {
+                Some(aux) => match aux.get("spec") {
+                    Some(spec) => println!("{}", spec),
+                    None => {
+                        eprintln!("lab wake-spec: entity has no aux.spec");
+                        exit(1);
+                    }
+                },
+                None => {
+                    eprintln!("lab wake-spec: frequency not found");
+                    exit(1);
+                }
+            }
+        }
+        "wake-handled" => {
+            // lab wake-handled <act_hash>
+            // Exit 0 if an `awakened` receipt already exists for this act_hash.
+            // Exit 1 if not yet handled (idempotency check for receivers).
+            if rest.is_empty() {
+                eprintln!("usage: lab wake-handled <act_hash>");
+                exit(2);
+            }
+            let (url, key) = load_creds();
+            let query = format!("did=eq.awakened&this=eq.{}&limit=1&select=content_hash", pct(&rest[0]));
+            let out = rest_read(&url, &key, LEDGER, &query);
+            let rows: Vec<Value> = serde_json::from_str(&out).unwrap_or_default();
+            if rows.is_empty() {
+                exit(1);
+            }
+            // already handled — exit 0 (default)
+        }
+        "wake-receipt" => {
+            // lab wake-receipt <act_hash> <freq> --status <s> [--verb <v>] [--result <r>] [--reason <r>]
+            // Writes the canonical `awakened` receipt for a tap.
+            // status: closed | refused | failed
+            // --verb   the verb that was run (for closed/failed)
+            // --result output of the verb (for closed)
+            // --reason why it was refused (for refused)
+            let (mut act_hash, mut freq) = (None::<String>, None::<String>);
+            let mut status = "closed".to_string();
+            let (mut verb, mut result, mut reason) = (None::<String>, None::<String>, None::<String>);
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--status" => { status = rest.get(i+1).cloned().unwrap_or(status); i += 2; }
+                    "--verb"   => { verb   = rest.get(i+1).cloned(); i += 2; }
+                    "--result" => { result = rest.get(i+1).cloned(); i += 2; }
+                    "--reason" => { reason = rest.get(i+1).cloned(); i += 2; }
+                    s => {
+                        if act_hash.is_none() { act_hash = Some(s.to_string()); }
+                        else if freq.is_none() { freq = Some(s.to_string()); }
+                        i += 1;
+                    }
+                }
+            }
+            let (act_hash, freq) = match (act_hash, freq) {
+                (Some(a), Some(f)) => (a, f),
+                _ => {
+                    eprintln!("usage: lab wake-receipt <act_hash> <freq> --status <s> [--verb <v>] [--result <r>] [--reason <r>]");
+                    exit(2);
+                }
+            };
+            let (url, key) = load_creds();
+            let when = now_utc();
+            let mut extra = serde_json::Map::new();
+            extra.insert("freq".into(), Value::String(freq.clone()));
+            if let Some(v) = verb   { extra.insert("verb".into(),   Value::String(v)); }
+            if let Some(r) = result { extra.insert("result".into(), Value::String(r)); }
+            if let Some(r) = reason { extra.insert("reason".into(), Value::String(r)); }
+            let (receipt, c_hash, t_hash) = canonical_receipt(
+                &hostname(),
+                "awakened",
+                &act_hash,
+                &when,
+                "",
+                &freq,
+                "",
+                "",
+                &status,
+                Some(extra),
+            );
+            let row = act_row(&receipt, &c_hash, &t_hash);
+            let (resp, code) = write_act_row(&url, &key, &row);
+            if !(200..300).contains(&code) {
+                eprintln!("lab wake-receipt: ledger rejected (HTTP {}): {}", code, resp.trim());
+                exit(1);
+            }
+            eprintln!("   wake-receipt → logline_acts [canonical] {}", c_hash);
+            print!("{}", resp);
         }
         "help" | "-h" | "--help" => usage(),
         other => {
