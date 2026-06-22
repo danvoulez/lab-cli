@@ -44,6 +44,21 @@ lab law check activate.route_to_devin.v1
 `lab law ...` reads projection documents from Mongo and always reports that the
 output is non-authoritative.
 
+Candidate legislative writes use a constrained command, not generic `lab act`:
+
+```bash
+lab law propose rule:constitution/current-custody-surface \
+  --title 'Current custody surface' \
+  --text 'public.logline_acts is the current custody ledger; public.lab_log is legacy historical material.' \
+  --superior act:<constitutional-root-hash> \
+  --source post-reconciliation-2026-06-22 \
+  --reason 'Needed to close the lab_log/logline_acts split before further lawmaking.'
+```
+
+`lab law propose` always writes `status=candidate` and does not admit active
+law. It requires a superior content hash and refuses to write if the superior is
+not present in `public.logline_acts`.
+
 ## Environment
 
 ```bash

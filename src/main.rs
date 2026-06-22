@@ -2765,9 +2765,200 @@ fn print_non_authoritative(doc: &Value) {
     );
 }
 
+fn content_ref_hash(reference: &str) -> &str {
+    reference.strip_prefix("act:").unwrap_or(reference)
+}
+
+fn infer_rule_namespace(rule_id: &str) -> String {
+    rule_id
+        .strip_prefix("rule:")
+        .and_then(|s| s.split('/').next())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn split_refs(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn ensure_superiors_exist(url: &str, key: &str, superiors: &[String]) {
+    for superior in superiors {
+        let hash = content_ref_hash(superior);
+        let query = format!("content_hash=eq.{}&select=content_hash&limit=1", pct(hash));
+        let body = rest_read(url, key, LEDGER, &query);
+        let rows: Vec<Value> = serde_json::from_str(&body).unwrap_or_default();
+        if rows.is_empty() {
+            eprintln!(
+                "lab law propose: superior not found in {}: {}",
+                LEDGER, superior
+            );
+            exit(1);
+        }
+    }
+}
+
+fn ensure_rule_not_registered(url: &str, key: &str, rule_id: &str) {
+    let query = format!(
+        "this=eq.{}&select=content_hash,did,status&limit=1",
+        pct(rule_id)
+    );
+    let body = rest_read(url, key, LEDGER, &query);
+    let rows: Vec<Value> = serde_json::from_str(&body).unwrap_or_default();
+    if let Some(row) = rows.first() {
+        eprintln!(
+            "lab law propose: rule id already appears in {}: {}",
+            LEDGER, rule_id
+        );
+        eprintln!("{}", serde_json::to_string(row).unwrap_or_default());
+        exit(1);
+    }
+}
+
+fn cmd_law_propose(args: &[String]) {
+    let mut rule_id = None::<String>;
+    let mut title = None::<String>;
+    let mut text = None::<String>;
+    let mut reason = None::<String>;
+    let mut source = None::<String>;
+    let mut kind = "rule".to_string();
+    let mut namespace = None::<String>;
+    let mut who = None::<String>;
+    let mut superiors = Vec::<String>::new();
+    let mut dry_run = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--title" => {
+                title = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--text" => {
+                text = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--reason" => {
+                reason = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--source" => {
+                source = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--superior" => {
+                if let Some(raw) = args.get(i + 1) {
+                    superiors.extend(split_refs(raw));
+                }
+                i += 2;
+            }
+            "--kind" => {
+                kind = args.get(i + 1).cloned().unwrap_or(kind);
+                i += 2;
+            }
+            "--namespace" => {
+                namespace = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--as" => {
+                who = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            s => {
+                if rule_id.is_none() {
+                    rule_id = Some(s.to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+
+    let (rule_id, title, text, reason, source) = match (rule_id, title, text, reason, source) {
+        (Some(r), Some(t), Some(body), Some(why), Some(src)) => (r, t, body, why, src),
+        _ => {
+            eprintln!("usage: lab law propose <rule_id> --title <title> --text <text> --superior <act:hash> --source <source> --reason <reason> [--kind rule] [--namespace ns] [--as who] [--dry-run]");
+            exit(2);
+        }
+    };
+    if !rule_id.starts_with("rule:") {
+        eprintln!("lab law propose: rule_id must start with rule:");
+        exit(2);
+    }
+    if superiors.is_empty() {
+        eprintln!("lab law propose: at least one --superior content hash is required");
+        exit(2);
+    }
+
+    let namespace = namespace.unwrap_or_else(|| infer_rule_namespace(&rule_id));
+    let mut extra = serde_json::Map::new();
+    extra.insert("rule_id".into(), Value::String(rule_id.clone()));
+    extra.insert("title".into(), Value::String(title));
+    extra.insert("text".into(), Value::String(text));
+    extra.insert("kind".into(), Value::String(kind));
+    extra.insert("namespace".into(), Value::String(namespace));
+    extra.insert("reason".into(), Value::String(reason));
+    extra.insert("source".into(), Value::String(source));
+    extra.insert(
+        "superior".into(),
+        Value::Array(superiors.iter().cloned().map(Value::String).collect()),
+    );
+    extra.insert(
+        "legislative_status".into(),
+        Value::String("candidate".into()),
+    );
+    extra.insert(
+        "procedure".into(),
+        Value::String("lab.law.propose.v0".into()),
+    );
+    extra.insert("authoritative".into(), Value::Bool(false));
+    extra.insert("non_authoritative_until_admitted".into(), Value::Bool(true));
+    extra.insert("review_required".into(), Value::Bool(true));
+
+    let (receipt, c_hash, t_hash) = canonical_receipt(
+        &who.unwrap_or_else(hostname),
+        "proposed.rule.v1",
+        &rule_id,
+        &now_utc(),
+        "lab-law-propose",
+        &superiors.join(","),
+        "candidate requires status/rulemaking review",
+        "not active law unless admitted by later rulemaking act",
+        "candidate",
+        Some(extra),
+    );
+    let row = act_row(&receipt, &c_hash, &t_hash);
+    if dry_run {
+        println!("{}", serde_json::to_string_pretty(&row).unwrap_or_default());
+        return;
+    }
+
+    let (url, key) = load_creds();
+    ensure_superiors_exist(&url, &key, &superiors);
+    ensure_rule_not_registered(&url, &key, &rule_id);
+    let (resp, code) = write_act_row(&url, &key, &row);
+    if !(200..300).contains(&code) {
+        eprintln!(
+            "lab law propose: ledger rejected (HTTP {}): {}",
+            code,
+            resp.trim()
+        );
+        exit(1);
+    }
+    eprintln!("   proposed-rule → logline_acts [candidate] {}", c_hash);
+    print!("{}", resp);
+}
+
 fn cmd_law(rest: &[String]) {
     if rest.is_empty() {
-        eprintln!("usage: lab law <current|gaps|graph|check> ...");
+        eprintln!("usage: lab law <current|gaps|graph|check|propose> ...");
         exit(2);
     }
     match rest[0].as_str() {
@@ -2891,8 +3082,11 @@ fn cmd_law(rest: &[String]) {
                 }
             }
         }
+        "propose" => {
+            cmd_law_propose(&rest[1..]);
+        }
         _ => {
-            eprintln!("usage: lab law <current|gaps|graph|check> ...");
+            eprintln!("usage: lab law <current|gaps|graph|check|propose> ...");
             exit(2);
         }
     }
@@ -3006,6 +3200,7 @@ fn usage() {
          \x20 lab wake-receipt <act_hash> <freq> --status <s> [--verb <v>] [--result <r>] [--reason <r>]  write awakened receipt\n\
          \x20 lab project <all|law|reconcile>   call Santo-Andre-Laboratory/PROJECTIONS wrappers\n\
          \x20 lab law <current|gaps|graph|check> read non-authoritative law projections\n\
+         \x20 lab law propose <rule_id> --title <t> --text <t> --superior <act:hash> --source <s> --reason <r>  write candidate rule\n\
          \x20 lab commands                  list builtins + discovered plugins\n\
          \x20 lab new-command <name>        scaffold <lab-root>/commands/<name>\n\
          \x20 lab <name> [args]             run <lab-root>/commands/<name>"
