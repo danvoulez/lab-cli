@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+lab-calendar — projection bridge: scheduled acts → ICS feed
+
+Generates an iCalendar (.ics) file from logline_acts status=scheduled records.
+Google Calendar can subscribe to the ICS URL or import the file.
+
+Usage:
+  lab calendar generate          # write ~/.lab/lab-schedule.ics
+  lab calendar serve [port]      # serve ICS over HTTP (default 8080)
+  lab calendar sync              # generate + optionally push to gcalcli
+
+The calendar is a projection. The ledger is the source of truth.
+"""
+
+import json
+import sys
+import os
+import subprocess
+import http.server
+import socketserver
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
+
+LAB_HOME = os.path.expanduser("~/.lab")
+ICS_PATH = os.path.join(LAB_HOME, "lab-schedule.ics")
+
+
+def rfc3339_to_ical(dt_str):
+    """Convert 2026-06-22T08:00:00Z to iCal UTC format."""
+    dt_str = dt_str.replace("Z", "+00:00")
+    dt = datetime.fromisoformat(dt_str)
+    return dt.strftime("%Y%m%dT%H%M%SZ")
+
+
+def escape_ical(text):
+    """Escape commas, backslashes, semicolons, and newlines for iCal."""
+    return text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+
+def fetch_scheduled():
+    """Query logline_acts for scheduled records via lab CLI."""
+    result = subprocess.run(
+        ["lab", "read", "logline_acts", "status=eq.scheduled&order=when.asc&limit=200"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"lab-calendar: lab read failed: {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print("lab-calendar: invalid JSON from lab read", file=sys.stderr)
+        sys.exit(1)
+
+
+def generate_ics(rows):
+    """Build iCalendar string from scheduled act rows."""
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Santo Andre Laboratory//Lab Calendar//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        f"X-WR-CALNAME:Santo Andre Lab Schedule",
+        f"X-WR-TIMEZONE:UTC",
+    ]
+
+    seen_uids = set()
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        when = row.get("when", "")
+        if not when:
+            continue
+
+        this = row.get("this", "Untitled")
+        did = row.get("did", "")
+        who = row.get("who", "")
+        content_hash = row.get("content_hash", "")
+        aux = row.get("aux") or {}
+
+        # UID from content_hash (stable, deduped)
+        uid = content_hash or f"{who}-{did}-{when}"
+        if uid in seen_uids:
+            continue
+        seen_uids.add(uid)
+
+        # Duration: default 30 min, or from aux.duration_minutes
+        duration_min = aux.get("duration_minutes", aux.get("duration", 30))
+        try:
+            duration_min = int(duration_min)
+        except (ValueError, TypeError):
+            duration_min = 30
+
+        start = rfc3339_to_ical(when)
+        end_dt = datetime.fromisoformat(when.replace("Z", "+00:00")) + timedelta(minutes=duration_min)
+        end = end_dt.strftime("%Y%m%dT%H%M%SZ")
+
+        # Build description
+        desc_parts = [
+            f"Process: {did}",
+            f"Box: {aux.get('box', who)}",
+            f"Target: {aux.get('target_process', 'N/A')}",
+            f"Playbook: {aux.get('playbook_macro', 'N/A')}",
+            f"ACU limit: {aux.get('acu_limit', 'N/A')}",
+            f"Idempotency: {aux.get('idempotency_key', 'N/A')}",
+            f"Content hash: {content_hash}",
+            "",
+            "Source: public.logline_acts (Santo Andre Laboratory)",
+        ]
+        description = escape_ical("\\n".join(desc_parts))
+
+        summary = escape_ical(f"[{did}] {this}")
+
+        lines.extend([
+            "BEGIN:VEVENT",
+            f"UID:{uid}@santo-andre-lab",
+            f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+            f"DTSTART:{start}",
+            f"DTEND:{end}",
+            f"SUMMARY:{summary}",
+            f"DESCRIPTION:{description}",
+            f"LOCATION:{who}",
+            "STATUS:CONFIRMED",
+            "END:VEVENT",
+        ])
+
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def cmd_generate():
+    rows = fetch_scheduled()
+    ics = generate_ics(rows)
+    os.makedirs(LAB_HOME, exist_ok=True)
+    with open(ICS_PATH, "w", newline="") as f:
+        f.write(ics)
+    print(f"lab-calendar: generated {ICS_PATH} ({len(rows)} event(s))")
+
+
+class ICSServer(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/lab-schedule.ics", "/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/calendar; charset=utf-8")
+            self.send_header("Content-Disposition", "inline; filename=lab-schedule.ics")
+            self.end_headers()
+            with open(ICS_PATH, "rb") as f:
+                self.wfile.write(f.read())
+        else:
+            self.send_error(404)
+
+    def log_message(self, format, *args):
+        pass  # quiet
+
+
+def cmd_serve(port=8080):
+    if not os.path.exists(ICS_PATH):
+        print("lab-calendar: no ICS file. Run 'lab calendar generate' first.", file=sys.stderr)
+        sys.exit(2)
+
+    with socketserver.TCPServer(("", port), ICSServer) as httpd:
+        print(f"lab-calendar: serving http://0.0.0.0:{port}/lab-schedule.ics")
+        print("lab-calendar: Google Calendar → Add calendar → From URL")
+        print(f"lab-calendar: paste http://<your-box-ip>:{port}/lab-schedule.ics")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nlab-calendar: stopped.")
+
+
+def cmd_sync():
+    cmd_generate()
+    # If gcalcli is authenticated, offer to push. Otherwise just generate.
+    result = subprocess.run(["gcalcli", "list"], capture_output=True, text=True)
+    if result.returncode == 0:
+        print("lab-calendar: gcalcli is available. Use 'gcalcli import' to push the ICS.")
+    else:
+        print("lab-calendar: gcalcli not authenticated. ICS file is ready at:")
+        print(f"  {ICS_PATH}")
+        print("lab-calendar: Google Calendar → Settings → Import → Select the .ics file")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: lab calendar generate | serve [port] | sync")
+        sys.exit(2)
+
+    sub = sys.argv[1]
+    if sub == "generate":
+        cmd_generate()
+    elif sub == "serve":
+        port = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
+        cmd_serve(port)
+    elif sub == "sync":
+        cmd_sync()
+    else:
+        print(f"lab-calendar: unknown command '{sub}'")
+        print("usage: lab calendar generate | serve [port] | sync")
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

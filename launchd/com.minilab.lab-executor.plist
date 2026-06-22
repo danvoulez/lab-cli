@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.minilab.lab-executor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ubl-ops/cli/target/release/lab</string>
+    <string>executor</string>
+    <string>daemon</string>
+    <string>10</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>/Users/ubl-ops</string>
+    <key>PATH</key><string>/Users/ubl-ops/.local/bin:/Users/ubl-ops/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/ubl-ops/.lab/logs/lab-executor.out</string>
+  <key>StandardErrorPath</key><string>/Users/ubl-ops/.lab/logs/lab-executor.err</string>
+</dict>
+</plist>
